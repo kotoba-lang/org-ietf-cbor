@@ -1,5 +1,7 @@
 # dag-cbor-clj
 
+[![CI](https://github.com/kotoba-lang/dag-cbor/actions/workflows/ci.yml/badge.svg)](https://github.com/kotoba-lang/dag-cbor/actions/workflows/ci.yml)
+
 **Definite-length CBOR (RFC 8949) encode/decode in pure Clojure — with both a
 canonical (dag-cbor key-sorted) encoder and an order-preserving one for
 signing payloads. No deps, babashka-friendly.**
