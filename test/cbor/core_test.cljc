@@ -88,3 +88,30 @@
     (is (= {"h" {"t" "x"} "p" {"b" 1 "a" 2} "s" {"t" "E"}} (cbor/decode c)))
     ;; p's bytes keep b-before-a (61 62 = "b" first), not a-before-b
     (is (str/includes? (hx c) "616201616102"))))
+
+;; ── tags (major type 6) ───────────────────────────────────────────────────────
+(deftest tag-encode-vectors
+  ;; RFC 8949 Appendix A: 0("2013-03-21T20:04:00Z") → c0 74 …
+  (is (= "c074323031332d30332d32315432303a30343a30305a"
+         (enc (cbor/tagged 0 "2013-03-21T20:04:00Z"))))
+  ;; tag 42 wrapping a 3-byte byte string → d8 2a 43 010203
+  (is (= "d82a43010203" (enc (cbor/tagged 42 (bytes-of [1 2 3])))))
+  ;; tag number uses the same head widths as uints: tag 1000 → d9 03e8
+  (is (= "d903e800" (enc (cbor/tagged 1000 0)))))
+
+(deftest tag-roundtrip
+  (let [t (cbor/decode (cbor/encode (cbor/tagged 42 (bytes-of [0 1 113]))))]
+    (is (cbor/tagged? t))
+    (is (= 42 (cbor/tag-number t)))
+    (is (= [0 1 113] (map #(bit-and % 0xff) (seq (cbor/tag-value t))))))
+  ;; tags nest inside maps/arrays and round-trip in place
+  (let [m (cbor/decode (cbor/encode {"link" (cbor/tagged 42 (bytes-of [9]))
+                                     "n" 7}))]
+    (is (= 7 (get m "n")))
+    (is (cbor/tagged? (get m "link")))
+    (is (= 42 (cbor/tag-number (get m "link"))))))
+
+(deftest tagged-equality
+  (is (= (cbor/tagged 42 "x") (cbor/tagged 42 "x")))
+  (is (not= (cbor/tagged 42 "x") (cbor/tagged 43 "x")))
+  (is (not= (cbor/tagged 42 "x") (cbor/tagged 42 "y"))))

@@ -14,8 +14,17 @@
 ;;                         byte strings as bytes, ints as Long/number, bool/nil)
 ;;
 ;; Supported major types: 0 uint · 1 negint · 2 byte-string · 3 text · 4 array ·
-;; 5 map · 7 (false/true/null). No indefinite lengths, no floats, no tags — a tight
-;; profile that covers structured signing payloads and IPLD-ish data.
+;; 5 map · 6 tag (as an explicit `Tagged` wrapper — see below) · 7
+;; (false/true/null). No indefinite lengths, no floats — a tight profile that
+;; covers structured signing payloads and IPLD data.
+;;
+;;   (tagged 42 bytes)   — encodes as major type 6, tag `n`, then the wrapped
+;;                         value; decodes back to a `Tagged`. Plain data never
+;;                         silently becomes a tag and a tag never silently
+;;                         becomes plain data — the wrapper is always explicit,
+;;                         so canonical bytes stay unambiguous. IPLD's CID link
+;;                         (tag 42) is layered on top by `kotoba-lang/ipld`;
+;;                         this namespace stays codec-generic.
 ;;
 ;; PORTABLE (.cljc, real on both platforms — this used to be `.clj`-only despite
 ;; every downstream repo's docstring calling that out as a known gap). Byte
@@ -35,6 +44,35 @@
 (defn ordered
   "Wrap an ordered seq of [k v] pairs as a map whose key order `encode` preserves."
   [pairs] (OrderedMap. pairs))
+
+;; A CBOR tag (major type 6): tag number `n` wrapping `value`. Encoded as the
+;; tag head followed by the encoded `value`; `decode` reconstructs the wrapper.
+;; Field access goes through `tag-number`/`tag-value` (NOT `.-n`/`.-value` at
+;; call sites — nbb, among others, does not implement direct deftype field
+;; access, which is exactly how the multihash-vector bug stayed invisible).
+(deftype Tagged [n value]
+  #?@(:clj  [Object
+             (equals [_ other]
+               (and (instance? Tagged other)
+                    (= n (.-n ^Tagged other))
+                    (= value (.-value ^Tagged other))))
+             (hashCode [_] (hash [n value]))]
+      :cljs [IEquiv
+             (-equiv [_ other]
+               (and (instance? Tagged other)
+                    (= n (.-n other))
+                    (= value (.-value other))))
+             IHash
+             (-hash [_] (hash [n value]))]))
+
+(defn tagged
+  "Wrap `value` in CBOR tag `n` (major type 6). `n` is a non-negative integer."
+  [n value]
+  (Tagged. n value))
+
+(defn tagged? [x] (instance? Tagged x))
+(defn tag-number [^Tagged t] (.-n t))
+(defn tag-value [^Tagged t] (.-value t))
 
 ;; ── byte sink/source (the only platform-specific plumbing) ───────────────────
 (defn- new-out []
@@ -140,6 +178,8 @@
     (string? x)         (let [b (str->bytes x)] (write-head o 3 (alength b)) (write-bytes! o b))
     (keyword? x)        (let [b (str->bytes (name x))] (write-head o 3 (alength b)) (write-bytes! o b))
     (bytes-like? x)     (do (write-head o 2 (alength x)) (write-bytes! o x))
+    (instance? Tagged x) (do (write-head o 6 (tag-number x))
+                             (encode-into o (tag-value x)))
     (instance? OrderedMap x) (encode-pairs o (.-pairs ^OrderedMap x))
     (map? x)            (encode-pairs o (sort-by key dag-cbor-key< (seq x)))
     (sequential? x)     (do (write-head o 4 (count x)) (doseq [e x] (encode-into o e)))
@@ -187,6 +227,7 @@
         3 (bytes->str (read-bytes! in (read-arg in info)))
         4 (vec (repeatedly (read-arg in info) #(decode-from in)))
         5 (into {} (repeatedly (read-arg in info) #(let [k (decode-from in)] [k (decode-from in)])))
+        6 (Tagged. (read-arg in info) (decode-from in))
         7 (case (int info) 20 false 21 true 22 nil
               (throw (ex-info "cbor: unsupported simple/float" {:info info})))
         (throw (ex-info "cbor: unsupported major type" {:major major}))))))
