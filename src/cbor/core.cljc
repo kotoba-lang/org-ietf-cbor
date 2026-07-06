@@ -40,30 +40,35 @@
 ;; An order-preserving map (vs. a Clojure map, which `encode` canonical-sorts).
 ;; Nestable: an OrderedMap value inside another OrderedMap keeps its own order —
 ;; what CAIP-122 CACAO needs (the {h,p,s} envelope AND p's 8 fields are ordered).
-(deftype OrderedMap [pairs])
+;;
+;; `defrecord`, not `deftype`: a bare `deftype` with no protocol impl uses JVM
+;; identity equality (two OrderedMaps with the same pairs are NOT `=`), and
+;; adding one via `#?@(:clj [Object ...] :cljs [IEquiv ...])` (the shape
+;; `Tagged` below used to need) doesn't even work on nbb -- SCI's `deftype`
+;; support does not dispatch a custom implementation of a BUILT-IN cljs.core
+;; protocol (`IEquiv`/`IHash`) on a deftype, `extend-type` included (confirmed
+;; empirically: `Protocol not found: IEquiv` either way, in total isolation
+;; from this file). `defrecord` sidesteps this entirely -- structural
+;; equality/hash are part of what the compiler generates for a record on
+;; EVERY platform (JVM/self-hosted cljs/nbb's SCI), not a protocol extension
+;; nbb has to resolve at all. No existing caller relied on OrderedMap's old
+;; identity-equality default (only `encode`/`decode` round-trip bytes are
+;; ever asserted on), so this is a strict gain, not a behavior change.
+(defrecord OrderedMap [pairs])
 (defn ordered
   "Wrap an ordered seq of [k v] pairs as a map whose key order `encode` preserves."
   [pairs] (OrderedMap. pairs))
 
 ;; A CBOR tag (major type 6): tag number `n` wrapping `value`. Encoded as the
 ;; tag head followed by the encoded `value`; `decode` reconstructs the wrapper.
-;; Field access goes through `tag-number`/`tag-value` (NOT `.-n`/`.-value` at
-;; call sites — nbb, among others, does not implement direct deftype field
-;; access, which is exactly how the multihash-vector bug stayed invisible).
-(deftype Tagged [n value]
-  #?@(:clj  [Object
-             (equals [_ other]
-               (and (instance? Tagged other)
-                    (= n (.-n ^Tagged other))
-                    (= value (.-value ^Tagged other))))
-             (hashCode [_] (hash [n value]))]
-      :cljs [IEquiv
-             (-equiv [_ other]
-               (and (instance? Tagged other)
-                    (= n (.-n other))
-                    (= value (.-value other))))
-             IHash
-             (-hash [_] (hash [n value]))]))
+;; Field access goes through `tag-number`/`tag-value` (NOT `:n`/`:value` map-
+;; keyword access, unlike `OrderedMap` above -- kept as narrow accessor fns so
+;; a future caller never has to know or care that a record is a map under the
+;; hood). Same `defrecord`-not-`deftype` reasoning as `OrderedMap`'s comment:
+;; structural equality/hash come for free on every platform including nbb,
+;; instead of a hand-written `#?@(:clj [Object ...] :cljs [IEquiv ...])`
+;; protocol block that nbb's SCI can't dispatch (confirmed empirically)."
+(defrecord Tagged [n value])
 
 (defn tagged
   "Wrap `value` in CBOR tag `n` (major type 6). `n` is a non-negative integer."
@@ -71,8 +76,8 @@
   (Tagged. n value))
 
 (defn tagged? [x] (instance? Tagged x))
-(defn tag-number [^Tagged t] (.-n t))
-(defn tag-value [^Tagged t] (.-value t))
+(defn tag-number [t] (:n t))
+(defn tag-value [t] (:value t))
 
 ;; ── byte sink/source (the only platform-specific plumbing) ───────────────────
 (defn- new-out []
@@ -180,7 +185,7 @@
     (bytes-like? x)     (do (write-head o 2 (alength x)) (write-bytes! o x))
     (instance? Tagged x) (do (write-head o 6 (tag-number x))
                              (encode-into o (tag-value x)))
-    (instance? OrderedMap x) (encode-pairs o (.-pairs ^OrderedMap x))
+    (instance? OrderedMap x) (encode-pairs o (:pairs x))
     (map? x)            (encode-pairs o (sort-by key dag-cbor-key< (seq x)))
     (sequential? x)     (do (write-head o 4 (count x)) (doseq [e x] (encode-into o e)))
     :else (throw (ex-info "cbor: unsupported type" {:type (type x) :value x}))))
