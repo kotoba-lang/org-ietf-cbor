@@ -111,6 +111,21 @@
     (is (cbor/tagged? (get m "link")))
     (is (= 42 (cbor/tag-number (get m "link"))))))
 
+;; ── truncated input fails closed rather than zero-padding ────────────────────
+(deftest truncated-string-throws-instead-of-zero-padding
+  ;; A byte-string/text-string header declaring more bytes than actually
+  ;; remain must raise, same as a truncated array/map/tag already does via
+  ;; decode-from's own read-byte! check -- not silently return a
+  ;; shorter-than-claimed result padded with zero bytes.
+  (let [full (cbor/encode "hello world this is a longer string")
+        truncated #?(:clj (byte-array (take 5 (seq full)))
+                     :cljs (.slice full 0 5))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (cbor/decode truncated))))
+  (let [full (cbor/encode (bytes-of (range 42)))
+        truncated #?(:clj (byte-array (take 4 (seq full)))
+                     :cljs (.slice full 0 4))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (cbor/decode truncated)))))
+
 (deftest tagged-equality
   (is (= (cbor/tagged 42 "x") (cbor/tagged 42 "x")))
   (is (not= (cbor/tagged 42 "x") (cbor/tagged 43 "x")))

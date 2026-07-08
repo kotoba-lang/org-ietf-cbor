@@ -108,9 +108,22 @@
                -1))))
 
 (defn- read-bytes! [in n]
-  #?(:clj (let [b (byte-array n)] (.read ^ByteArrayInputStream in b 0 n) b)
+  ;; InputStream.read(byte[],off,len) (:clj) and .slice (:cljs) both silently
+  ;; return fewer bytes than asked when the source runs out early -- neither
+  ;; throws on its own. A truncated byte-string/text-string header would
+  ;; otherwise decode into a zero-padded array wholly unlike the original
+  ;; bytes, with no error, instead of failing like every other truncated
+  ;; shape here (decode-from's own read-byte! check already catches a
+  ;; truncated array/map/tag).
+  #?(:clj (let [b (byte-array n)
+                r (.read ^ByteArrayInputStream in b 0 n)]
+            (when (and (pos? n) (not= r n))
+              (throw (ex-info "cbor: unexpected end of input" {})))
+            b)
      :cljs (let [{:keys [data pos]} @in
                  out (.slice data pos (+ pos n))]
+             (when (< (.-length out) n)
+               (throw (ex-info "cbor: unexpected end of input" {})))
              (swap! in assoc :pos (+ pos n))
              out)))
 
