@@ -45,7 +45,9 @@
   (is (= (enc (array-map "aa" 3 "b" 2 "a" 1))
          (enc (array-map "a" 1 "aa" 3 "b" 2))))
   ;; exact bytes: a3 "a"(6161)01 "b"(6162)02 "aa"(626161)03
-  (is (= "a361610161620262616103" (enc (array-map "aa" 3 "b" 2 "a" 1)))))
+  (is (= "a361610161620262616103" (enc (array-map "aa" 3 "b" 2 "a" 1))))
+  ;; UTF-8 BYTE length, not character count: "z" is one byte, "é" is two.
+  (is (= "a2617a0162c3a902" (enc (array-map "é" 2 "z" 1)))))
 
 ;; ── encode-ordered preserves the given order (CACAO-style) ────────────────────
 (deftest encode-ordered-keeps-order

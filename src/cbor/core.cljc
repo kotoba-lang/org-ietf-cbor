@@ -166,15 +166,23 @@
 (defn- key-bytes [k]
   (str->bytes (cond (string? k) k (keyword? k) (name k) :else (str k))))
 
+(defn- encoded-byte-count [b]
+  #?(:clj (count ^bytes b)
+     :cljs (.-length b)))
+
+(defn- unsigned-key-byte [b i]
+  #?(:clj (bit-and (aget ^bytes b (int i)) 0xff)
+     :cljs (bit-and (aget b i) 0xff)))
+
 (defn- dag-cbor-key< [a b]
   (let [ka (key-bytes a) kb (key-bytes b)
-        la (alength ka) lb (alength kb)]
+        la (encoded-byte-count ka) lb (encoded-byte-count kb)]
     (if (not= la lb)
       (< la lb)                                         ; shorter key first
       (loop [i 0]                                        ; then bytewise unsigned
         (cond (= i la) false
-              (not= (bit-and (aget ka i) 0xff) (bit-and (aget kb i) 0xff))
-              (< (bit-and (aget ka i) 0xff) (bit-and (aget kb i) 0xff))
+              (not= (unsigned-key-byte ka i) (unsigned-key-byte kb i))
+              (< (unsigned-key-byte ka i) (unsigned-key-byte kb i))
               :else (recur (inc i)))))))
 
 (defn- encode-pairs [o pairs]
@@ -193,9 +201,9 @@
     (true? x)           (write-byte! o 0xf5)
     (false? x)          (write-byte! o 0xf4)
     (integer? x)        (if (neg? x) (write-head o 1 (- (- x) 1)) (write-head o 0 x))
-    (string? x)         (let [b (str->bytes x)] (write-head o 3 (alength b)) (write-bytes! o b))
-    (keyword? x)        (let [b (str->bytes (name x))] (write-head o 3 (alength b)) (write-bytes! o b))
-    (bytes-like? x)     (do (write-head o 2 (alength x)) (write-bytes! o x))
+    (string? x)         (let [b (str->bytes x)] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
+    (keyword? x)        (let [b (str->bytes (name x))] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
+    (bytes-like? x)     (do (write-head o 2 (encoded-byte-count x)) (write-bytes! o x))
     (instance? Tagged x) (do (write-head o 6 (tag-number x))
                              (encode-into o (tag-value x)))
     (instance? OrderedMap x) (encode-pairs o (:pairs x))
