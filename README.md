@@ -53,9 +53,14 @@ division/mod and `+`/`*` specifically to stay correct up to
 ## Correctness
 
 ```bash
-clojure -M:test                    # JVM (or: bb test)
+clojure -M:test                    # JVM — 11 tests / 70 assertions
 npm install && npm run test:cljs   # real ClojureScript, via shadow-cljs node-test
 ```
+
+The `bb test` alternative that used to be noted here is **unavailable**:
+babashka was retired as this workspace's script host (ADR-2607173000) and the
+conversion left `scripts/tasks.edn` empty, so it has had no runnable path since
+2026-07-17 (ADR-2608131600). `clojure -M:test` is unaffected.
 
 ```
 Ran 7 tests containing 55 assertions.
