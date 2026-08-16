@@ -132,3 +132,16 @@
   (is (= (cbor/tagged 42 "x") (cbor/tagged 42 "x")))
   (is (not= (cbor/tagged 42 "x") (cbor/tagged 43 "x")))
   (is (not= (cbor/tagged 42 "x") (cbor/tagged 42 "y"))))
+
+(deftest finite-float64-round-trip-and-canonical-width
+  (is (= "fb3ff8000000000000" (enc 1.5)))
+  (is (= 1.5 (cbor/decode (cbor/encode 1.5))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (cbor/encode ##NaN)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (cbor/encode ##Inf))))
+
+(deftest decode-rejects-trailing-bytes
+  (let [encoded (cbor/encode {"x" 1})
+        with-extra #?(:clj (byte-array (concat (seq encoded) [0]))
+                      :cljs (js/Uint8Array. (clj->js (concat (seq encoded) [0]))))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cbor/decode with-extra)))))
