@@ -23,13 +23,14 @@ coordinators each open-code the major-type headers). This is that once.
 - **`encode-ordered`** — a map from an ordered `[k v]` seq, keys emitted as given.
   CAIP-122 CACAO and other insertion-order-sensitive wire formats need this;
   canonical sorting would corrupt the signature payload.
-- **`decode`** — maps → `{}`, arrays → `[]`, text → `String`, byte-strings →
-  bytes (byte-array on JVM, `Uint8Array` on cljs), ints → `Long`/number,
-  true/false/null.
+- **`decode`** — exactly one top-level value; maps → `{}`, arrays → `[]`,
+  text → `String`, byte-strings → bytes (byte-array on JVM, `Uint8Array` on
+  cljs), ints/finite float64 → numbers, true/false/null. Trailing bytes fail.
 
 Supported major types: 0 uint · 1 negint · 2 byte-string · 3 text · 4 array ·
-5 map · 7 (false/true/null). No indefinite lengths, floats, or tags — a tight
-profile covering structured signing payloads and IPLD-ish data.
+5 map · 6 explicit tags · 7 (false/true/null/finite float64). No indefinite
+lengths. Floats always encode as IEEE-754 binary64; NaN and infinities are
+rejected. `io-ipld` layers DAG-CBOR's tag-42-only and string-key rules on top.
 
 ## Portability
 
@@ -53,7 +54,7 @@ division/mod and `+`/`*` specifically to stay correct up to
 ## Correctness
 
 ```bash
-clojure -M:test                    # JVM — 11 tests / 70 assertions
+clojure -M:test                    # JVM — 13 tests / 75 assertions
 npm install && npm run test:cljs   # real ClojureScript, via shadow-cljs node-test
 ```
 

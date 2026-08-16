@@ -15,8 +15,9 @@
 ;;
 ;; Supported major types: 0 uint · 1 negint · 2 byte-string · 3 text · 4 array ·
 ;; 5 map · 6 tag (as an explicit `Tagged` wrapper — see below) · 7
-;; (false/true/null). No indefinite lengths, no floats — a tight profile that
-;; covers structured signing payloads and IPLD data.
+;; (false/true/null/finite float64). No indefinite lengths. Floats are always
+;; emitted as IEEE-754 binary64: DAG-CBOR has one canonical float width and
+;; excludes NaN and infinities from the IPLD Data Model.
 ;;
 ;;   (tagged 42 bytes)   — encodes as major type 6, tag `n`, then the wrapped
 ;;                         value; decodes back to a `Tagged`. Plain data never
@@ -35,7 +36,8 @@
 ;; JS string instead of java.lang.String — both are just "the platform's native
 ;; string/byte type").
 (ns cbor.core
-  #?(:clj (:import (java.io ByteArrayOutputStream ByteArrayInputStream))))
+  #?(:clj (:import (java.io ByteArrayOutputStream ByteArrayInputStream)
+                   (java.nio ByteBuffer))))
 
 ;; An order-preserving map (vs. a Clojure map, which `encode` canonical-sorts).
 ;; Nestable: an OrderedMap value inside another OrderedMap keeps its own order —
@@ -135,6 +137,23 @@
   #?(:clj (.getBytes ^String s "UTF-8")
      :cljs (.encode (js/TextEncoder.) s)))
 
+(defn- finite-number? [x]
+  #?(:clj (and (number? x) (Double/isFinite (double x)))
+     :cljs (and (number? x) (js/Number.isFinite x))))
+
+(defn- float64-bytes [x]
+  #?(:clj (-> (ByteBuffer/allocate 8) (.putDouble (double x)) .array)
+     :cljs (let [buffer (js/ArrayBuffer. 8)]
+             (.setFloat64 (js/DataView. buffer) 0 x false)
+             (js/Uint8Array. buffer))))
+
+(defn- bytes->float64 [bytes]
+  #?(:clj (.getDouble (ByteBuffer/wrap ^bytes bytes))
+     :cljs (.getFloat64 (js/DataView. (.-buffer bytes)
+                                     (.-byteOffset bytes)
+                                     (.-byteLength bytes))
+                        0 false)))
+
 ;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from `n`.
 ;; :clj uses real 64-bit `long` bit ops. :cljs CANNOT use bit-and/bit-shift-*
 ;; for this once `n` exceeds 2^32 -- JS's bitwise operators coerce their
@@ -201,6 +220,11 @@
     (true? x)           (write-byte! o 0xf5)
     (false? x)          (write-byte! o 0xf4)
     (integer? x)        (if (neg? x) (write-head o 1 (- (- x) 1)) (write-head o 0 x))
+    (number? x)         (if (finite-number? x)
+                          (do (write-byte! o 0xfb)
+                              (write-bytes! o (float64-bytes x)))
+                          (throw (ex-info "cbor: non-finite float unsupported"
+                                          {:value x})))
     (string? x)         (let [b (str->bytes x)] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
     (keyword? x)        (let [b (str->bytes (name x))] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
     (bytes-like? x)     (do (write-head o 2 (encoded-byte-count x)) (write-bytes! o x))
@@ -254,13 +278,25 @@
         4 (vec (repeatedly (read-arg in info) #(decode-from in)))
         5 (into {} (repeatedly (read-arg in info) #(let [k (decode-from in)] [k (decode-from in)])))
         6 (Tagged. (read-arg in info) (decode-from in))
-        7 (case (int info) 20 false 21 true 22 nil
-              (throw (ex-info "cbor: unsupported simple/float" {:info info})))
+        7 (case (int info)
+            20 false
+            21 true
+            22 nil
+            27 (let [value (bytes->float64 (read-bytes! in 8))]
+                 (when-not (finite-number? value)
+                   (throw (ex-info "cbor: non-finite float unsupported"
+                                   {:value value})))
+                 value)
+            (throw (ex-info "cbor: unsupported simple/float" {:info info})))
         (throw (ex-info "cbor: unsupported major type" {:major major}))))))
 
 (defn decode
-  "Decode CBOR bytes → Clojure data. Maps → {}, arrays → [], text → String,
-   byte-strings → bytes (byte-array on :clj, Uint8Array on :cljs), ints →
-   Long/number, true/false/null."
+  "Decode exactly one CBOR value. Maps → {}, arrays → [], text → String,
+   byte-strings → bytes (byte-array on :clj, Uint8Array on :cljs), ints and
+   finite float64 → numbers, true/false/null. Trailing bytes are rejected."
   [b]
-  (decode-from (new-in b)))
+  (let [in (new-in b)
+        value (decode-from in)]
+    (when-not (neg? (read-byte! in))
+      (throw (ex-info "cbor: trailing bytes after top-level value" {})))
+    value))
