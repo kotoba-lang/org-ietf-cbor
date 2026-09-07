@@ -1,0 +1,106 @@
+;; cbor.core -- definite-length CBOR heads (RFC 8949) as a pure Kotoba guest
+;; (oracle: src/cbor/core.cljc).
+;;
+;; The oracle's byte sink/source is ByteArrayOutputStream/Uint8Array --
+;; mechanism this guest cannot name, and :container-items is 32 (measured),
+;; so an arbitrary-length byte string cannot be a guest value either. The
+;; guest owns what the oracle's write-head/decode-from own: the HEAD
+;; arithmetic. Which major type a value takes, how the argument is
+;; minimally encoded, and how a head is read back off a byte count are
+;; product semantics and live here; the payload bytes stay in the host,
+;; exactly as org-ietf-pop3's body channel passes them.
+;;
+;; The guest's byte channel: encode-uint/negint return the 1/2/4/8
+;; argument bytes as a bounded vector (at most 8, inside 32); the host
+;; writes them. decode-uint takes the initial byte's info bits and a
+;; reader callback is NOT available -- so decode-arg takes the argument
+;; bytes as a bounded vector and reassembles big-endian by arithmetic
+;; (the oracle's own 2^32-safe reading).
+;;
+;; rem/mod have no admitted lowering (measured); division by 256 uses
+;; quot + bit-and 255 -- exact for non-negative arguments.
+;;
+;; Compile (single file, JVM-free):
+;;   kotoba compile kotoba/cbor/core.kotoba --target wasm32-browser --output core.wasm
+
+(ns cbor.core
+  (:export [head-major head-info encode-uint-args encode-negint-args
+            decode-arg uint-byte-count]))
+
+;; --- head decomposition -----------------------------------------------------
+
+(defn head-major [ib :i64] :i64
+  (i64-shift-right ib 5))
+
+(defn head-info [ib :i64] :i64
+  (bit-and ib 31))
+
+;; --- argument encoding ------------------------------------------------------
+;; The oracle's write-head: (< n 24) inline; 24/25/26/27 add 1/2/4/8 bytes.
+;; Each argument byte is (bit-and (i64-shift-right n s) 255) -- the oracle's
+;; byte-at, correct for non-negative n.
+
+(defn- div256 [n :i64] :i64
+  (quot n 256))
+
+;; i64 shift counts must be integer literals in [0,63] (measured), so the
+;; variable shift in the oracle's byte-at becomes a fixed-shift case tree.
+(defn- byte-at-0 [n :i64] :i64 (bit-and (i64-shift-right n 0) 255))
+(defn- byte-at-8 [n :i64] :i64 (bit-and (i64-shift-right n 8) 255))
+(defn- byte-at-16 [n :i64] :i64 (bit-and (i64-shift-right n 16) 255))
+(defn- byte-at-24 [n :i64] :i64 (bit-and (i64-shift-right n 24) 255))
+(defn- byte-at-32 [n :i64] :i64 (bit-and (i64-shift-right n 32) 255))
+(defn- byte-at-40 [n :i64] :i64 (bit-and (i64-shift-right n 40) 255))
+(defn- byte-at-48 [n :i64] :i64 (bit-and (i64-shift-right n 48) 255))
+(defn- byte-at-56 [n :i64] :i64 (bit-and (i64-shift-right n 56) 255))
+
+(defn uint-byte-count [n :i64] :i64
+  (if (< n 24) 0
+      (if (< n 256) 1
+          (if (< n 65536) 2
+              (if (< n 4294967296) 4
+                  8)))))
+
+(defn encode-uint-args [n :i64] :document
+  (let [c (uint-byte-count n)]
+    (if (= c 0)
+      (document-vector)
+      (if (= c 1)
+        (document-vector (document-i64 (byte-at-0 n)))
+        (if (= c 2)
+          (document-vector (document-i64 (byte-at-8 n)) (document-i64 (byte-at-0 n)))
+          (if (= c 4)
+            (document-vector (document-i64 (byte-at-24 n)) (document-i64 (byte-at-16 n))
+                             (document-i64 (byte-at-8 n)) (document-i64 (byte-at-0 n)))
+            (document-vector (document-i64 (byte-at-56 n)) (document-i64 (byte-at-48 n))
+                             (document-i64 (byte-at-40 n)) (document-i64 (byte-at-32 n))
+                             (document-i64 (byte-at-24 n)) (document-i64 (byte-at-16 n))
+                             (document-i64 (byte-at-8 n)) (document-i64 (byte-at-0 n)))))))))
+
+;; The oracle: major 1 argument is (- (- x) 1), so a negative value encodes
+;; as its complement; the guest takes the VALUE (already negated by the
+;; caller) and emits the same argument bytes.
+(defn encode-negint-args [value :i64] :document
+  (encode-uint-args (- (- value) 1)))
+
+;; --- argument decoding ------------------------------------------------------
+;; The oracle's read-n: big-endian reassembly by arithmetic
+;; (+ (* acc 256) byte) -- NOT bit-or/bit-shift, whose 32-bit JS truncation
+;; the oracle's comment warns about; arithmetic is exact to 2^53.
+
+(defn- read-loop [args :document i :i64 acc :i64] :i64
+  (if (>= i (document-count args))
+    acc
+    (let [b (option-value-of [:option :i64]
+                             (document-i64-value
+                              (option-value-of [:option :document]
+                                               (document-vector-at args i)
+                                               (document-i64 0)))
+                             0)]
+      (read-loop args (+ i 1) (+ (* acc 256) b)))))
+
+(defn decode-arg [info :i64 args :document] :i64
+  (if (< info 24) info
+      (if (= info 24)
+        (read-loop args 0 0)
+        (read-loop args 0 0))))
