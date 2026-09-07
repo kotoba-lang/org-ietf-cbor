@@ -1,6 +1,0 @@
-(ns test.cbor
-  (:export [test]))
-
-(defn test []
-  "Test cbor functions - stub")
-
