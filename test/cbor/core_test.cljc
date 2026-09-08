@@ -1,5 +1,5 @@
 (ns cbor.core-test
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             #?(:clj [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer [deftest is] :include-macros true])
             [cbor.core :as cbor]))
