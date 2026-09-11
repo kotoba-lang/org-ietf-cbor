@@ -36,6 +36,7 @@
 ;; JS string instead of java.lang.String — both are just "the platform's native
 ;; string/byte type").
 (ns cbor.core
+  {:kotoba/export [OrderedMap Tagged decode encode encode-ordered ordered tag-number tag-value tagged tagged?]}
   #?(:clj (:import (java.io ByteArrayOutputStream ByteArrayInputStream)
                    (java.nio ByteBuffer))))
 
