@@ -17,7 +17,7 @@
   reasoning in a comment while the implementation had quietly stopped
   matching it.
 
-      npx nbb --classpath src:test run-tests.cljs"
+      npx nbb --classpath src:test run-tests.cljk"
   (:require [cljs.test :as t]
             [cbor.core-test]))
 
