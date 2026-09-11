@@ -1,5 +1,5 @@
 ;; cbor.core -- definite-length CBOR heads (RFC 8949) as a pure Kotoba guest
-;; (oracle: src/cbor/core.cljc).
+;; (oracle: src/cbor/core.cljk).
 ;;
 ;; The oracle's byte sink/source is ByteArrayOutputStream/Uint8Array --
 ;; mechanism this guest cannot name, and :container-items is 32 (measured),
