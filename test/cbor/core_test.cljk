@@ -145,3 +145,13 @@
                       :cljs (js/Uint8Array. (clj->js (concat (seq encoded) [0]))))]
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (cbor/decode with-extra)))))
+
+
+#?(:cljs
+   (deftest byte-container-write-does-not-construct-an-iterator-seq
+     ;; This is a binary buffer, not a generic sequence. Walking its iterator
+     ;; allocated one sequence node per byte in canonical re-encoding.
+     (let [bytes (js/Uint8Array.from #js [0 127 128 255])]
+       (aset bytes js/Symbol.iterator
+             (fn [] (throw (js/Error. "byte writer must use indexed access"))))
+       (is (= [68 0 127 128 255] (vec (array-seq (cbor/encode bytes))))))))

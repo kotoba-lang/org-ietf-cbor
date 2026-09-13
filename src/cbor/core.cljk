@@ -93,7 +93,7 @@
 
 (defn- write-bytes! [o bs]
   #?(:clj (.write ^ByteArrayOutputStream o ^bytes bs)
-     :cljs (doseq [b (seq bs)] (.push o (bit-and (int b) 0xff)))))
+     :cljs (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))))
 
 (defn- out->bytes [o]
   #?(:clj (.toByteArray ^ByteArrayOutputStream o)
