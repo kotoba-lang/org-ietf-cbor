@@ -128,6 +128,20 @@
                      :cljs (.slice full 0 4))]
     (is (thrown? #?(:clj Exception :cljs js/Error) (cbor/decode truncated)))))
 
+(deftest a-truncated-head-argument-throws-instead-of-reading-past-the-end
+  ;; adr-2609242330 S1. Before the pure rewrite the byte source answered -1
+  ;; at end of input and `read-arg` folded that -1 into the argument, so a
+  ;; head whose argument bytes were missing decoded to a number: `[0x18]`
+  ;; (uint, 1-byte argument, none present) came back as -1, `[0x19]` as
+  ;; -257, `[0x1a 0 1]` as 65279. The reason literal is pinned: a refusal
+  ;; for another reason is not this one.
+  (doseq [head [[0x18] [0x19] [0x19 1] [0x1a 0 1] [0x1b 0 0 0 0 0 0 0] [0x38] [0x58] [0x78 3]
+                [0x98] [0xb8] [0xd8] [0xfb 0 0 0]]]
+    (is (= "cbor: unexpected end of input"
+           (try (cbor/decode (bytes-of head)) :decoded
+                (catch #?(:clj Exception :cljs js/Error) e (ex-message e))))
+        (pr-str head))))
+
 (deftest tagged-equality
   (is (= (cbor/tagged 42 "x") (cbor/tagged 42 "x")))
   (is (not= (cbor/tagged 42 "x") (cbor/tagged 43 "x")))

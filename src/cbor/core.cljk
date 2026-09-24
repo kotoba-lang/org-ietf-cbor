@@ -27,18 +27,14 @@
 ;;                         (tag 42) is layered on top by `kotoba-lang/ipld`;
 ;;                         this namespace stays codec-generic.
 ;;
-;; PORTABLE (.cljc, real on both platforms — this used to be `.clj`-only despite
-;; every downstream repo's docstring calling that out as a known gap). Byte
-;; buffers are `java.io.ByteArrayOutputStream`/`ByteArrayInputStream` on :clj and
-;; a plain growable JS array / an atom-backed cursor over a Uint8Array on :cljs;
-;; `encode`/`decode`'s public contract (bytes in, bytes/Clojure-data out) is
-;; unchanged on :clj and equivalent on :cljs (Uint8Array instead of byte-array,
-;; JS string instead of java.lang.String — both are just "the platform's native
-;; string/byte type").
+;; PORTABLE and PURE (adr-2609242330 S1, 2026-09-24): the encoder builds a
+;; vector of ints and the decoder threads a position; only the leaves listed
+;; under "the byte plumbing" below differ per host. `encode`/`decode`'s public
+;; contract (bytes in, bytes/Clojure-data out) is unchanged: byte-array on
+;; :clj, Uint8Array on :cljs, and a vector of ints 0..255 in Kotoba.
 (ns cbor.core
   {:kotoba/export [OrderedMap Tagged decode encode encode-ordered ordered tag-number tag-value tagged tagged?]}
-  #?(:clj (:import (java.io ByteArrayOutputStream ByteArrayInputStream)
-                   (java.nio ByteBuffer))))
+  )
 
 ;; An order-preserving map (vs. a Clojure map, which `encode` canonical-sorts).
 ;; Nestable: an OrderedMap value inside another OrderedMap keeps its own order —
@@ -82,260 +78,359 @@
 (defn tag-number [t] (:n t))
 (defn tag-value [t] (:value t))
 
-;; ── byte sink/source (the only platform-specific plumbing) ───────────────────
-;; Each body below also carries a `:default` clause. The Kotoba reader's only
-;; feature is :kotoba, so a `#?(:clj .. :cljs ..)`-only body read as NOTHING and
-;; the compiler refused the whole module as "function body is empty"
-;; (adr-2609111900). Clojure still picks :clj and ClojureScript/nbb :cljs (first
-;; match), so no existing host changes. Where the byte plumbing is host interop
-;; (JS arrays, TextEncoder, DataView) the :default clause is the :cljs form, which
-;; the Kotoba compiler then refuses BY NAME at that call -- the honest next wall,
-;; not a silent stub. `byte-at` has a real Kotoba body (i64 bit ops).
-(defn- new-out []
-  #?(:clj (ByteArrayOutputStream.)
-     :cljs (array)
-     :default (array)))
+;; ── the byte plumbing (adr-2609242330 S1) ────────────────────────────────────
+;; The encoder and decoder are PURE: the output is a vector of ints 0..255
+;; built by `conj`/`into`, the input is read by position, and the cursor is
+;; a value threaded through the reads (`[value pos]`), not a mutable object.
+;; What is left per host is a handful of LEAVES, each with a `:default` that
+;; is a real Kotoba body -- never a copy of the :cljs host code, which the
+;; compiler refused by name (adr-2609242330 §2):
+;;
+;;   leaf               :clj / :cljs (speed)           :default (Kotoba)
+;;   str->bytes         getBytes / TextEncoder          string-code-point-at walk
+;;   float64-bytes      ByteBuffer / DataView           f64-to-bits + u64-shift-right
+;;   bytes->float64     ByteBuffer / DataView           i64-shift-left + f64-from-bits
+;;   finite-number?     isFinite                        exponent bits of f64-to-bits
+;;   in-count/in-byte/  alength / aget / .slice         count / nth / subvec
+;;   in-slice
+;;   write-input-bytes  by index / one chunk             conj loop
+;;   write-text         (str->bytes) / one chunk        str->bytes + into
+;;   out->bytes         byte-array / Uint8Array         the vector itself
+;;   bytes->str         String. / TextDecoder           (none: see below)
+;;   bytes-like?        bytes? / Uint8Array|Int8Array   (none: see below)
+;;
+;; The host branches must answer exactly what the `:default` answers: the
+;; golden corpus (test/cbor/golden.edn, written by the pre-S1 host encoder)
+;; pins the bytes, and scripts/verify-pure-leaves.cljk evaluates each
+;; `:default` body on nbb against its host twin.
+;;
+;; Two leaves have NO `:default`, on purpose, so the compiler reports them as
+;; `function body is empty` instead of a guessed body:
+;;   * bytes->str -- Kotoba text is UTF-8, but the language has no operation
+;;     that builds a string from bytes or code points (string-* heads read
+;;     strings; none constructs one from an i64). A language gap, not a
+;;     library one.
+;;   * bytes-like? -- a CBOR byte string must be told apart from an array of
+;;     small ints. adr-2609242330 makes bytes `vector<int 0..255>` for now,
+;;     which cannot be told apart from an array; that representation decision
+;;     is not this file's to make.
 
-(defn- write-byte! [o b]
-  #?(:clj (.write ^ByteArrayOutputStream o (int b))
-     :cljs (.push o (bit-and b 0xff))
-     :default (.push o (bit-and b 0xff))))
+(defn- out->bytes
+  "The encoder's output as the host's byte container. On :cljs an element
+  of V is either one byte or a whole Uint8Array/Int8Array chunk appended by
+  `write-input-bytes` / `write-text` (copied here once, with `.set`, which
+  converts an Int8Array's -1 to 255 as the old masking push did)."
+  [v]
+  #?(:clj (byte-array (map unchecked-byte v))
+     :cljs (let [n (reduce (fn [n x] (+ n (if (number? x) 1 (.-length x)))) 0 v)
+                 a (js/Uint8Array. n)]
+             (reduce (fn [pos x]
+                       (if (number? x)
+                         (do (aset a pos x) (inc pos))
+                         (do (.set a (if (instance? js/Int8Array x) (js/Uint8Array. (.-buffer x) (.-byteOffset x) (.-length x)) x) pos)
+                             (+ pos (.-length x)))))
+                     0 v)
+             a)
+     :default v))
 
-(defn- write-bytes! [o bs]
-  #?(:clj (.write ^ByteArrayOutputStream o ^bytes bs)
-     :cljs (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))
-     :default (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))))
+(defn- in-count [data]
+  #?(:clj (alength ^bytes data)
+     :cljs (.-length data)
+     :default (count data)))
 
-(defn- out->bytes [o]
-  #?(:clj (.toByteArray ^ByteArrayOutputStream o)
-     :cljs (js/Uint8Array. o)
-     :default (js/Uint8Array. o)))
+(defn- in-byte
+  "The unsigned byte at POS (an Int8Array / JVM byte[] is signed)."
+  [data pos]
+  #?(:clj (bit-and (aget ^bytes data (int pos)) 0xff)
+     :cljs (bit-and (aget data pos) 0xff)
+     :default (bit-and (nth data pos) 0xff)))
 
-(defn- new-in [b]
-  #?(:clj (ByteArrayInputStream. b)
-     :cljs (atom {:data b :pos 0})
-     :default (atom {:data b :pos 0})))
+(defn- in-slice
+  "Bytes [FROM, TO) of DATA as a fresh container of DATA's own kind."
+  [data from to]
+  #?(:clj (java.util.Arrays/copyOfRange ^bytes data (int from) (int to))
+     :cljs (.slice data from to)
+     :default (subvec data from to)))
 
-(defn- read-byte! [in]
-  #?(:clj (.read ^ByteArrayInputStream in)
-     :cljs (let [{:keys [data pos]} @in]
-             (if (< pos (alength data))
-               (do (swap! in assoc :pos (inc pos)) (bit-and (aget data pos) 0xff))
-               -1))
-     :default (let [{:keys [data pos]} @in]
-                (if (< pos (alength data))
-                  (do (swap! in assoc :pos (inc pos)) (bit-and (aget data pos) 0xff))
-                  -1))))
+(defn- utf8-code-point
+  "OUT with the UTF-8 encoding of code point CP appended (CP is a scalar
+  value: never a surrogate half)."
+  [out cp]
+  (cond
+    (< cp 0x80) (conj out cp)
+    (< cp 0x800) (conj out (+ 0xC0 (quot cp 64)) (+ 0x80 (bit-and cp 0x3F)))
+    (< cp 0x10000) (conj out (+ 0xE0 (quot cp 4096))
+                         (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                         (+ 0x80 (bit-and cp 0x3F)))
+    :else (conj out (+ 0xF0 (quot cp 262144))
+                (+ 0x80 (bit-and (quot cp 4096) 0x3F))
+                (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                (+ 0x80 (bit-and cp 0x3F)))))
 
-(defn- read-bytes! [in n]
-  ;; InputStream.read(byte[],off,len) (:clj) and .slice (:cljs) both silently
-  ;; return fewer bytes than asked when the source runs out early -- neither
-  ;; throws on its own. A truncated byte-string/text-string header would
-  ;; otherwise decode into a zero-padded array wholly unlike the original
-  ;; bytes, with no error, instead of failing like every other truncated
-  ;; shape here (decode-from's own read-byte! check already catches a
-  ;; truncated array/map/tag).
-  #?(:clj (let [b (byte-array n)
-                r (.read ^ByteArrayInputStream in b 0 n)]
-            (when (and (pos? n) (not= r n))
-              (throw (ex-info "cbor: unexpected end of input" {})))
-            b)
-     :cljs (let [{:keys [data pos]} @in
-                 out (.slice data pos (+ pos n))]
-             (when (< (.-length out) n)
-               (throw (ex-info "cbor: unexpected end of input" {})))
-             (swap! in assoc :pos (+ pos n))
-             out)
-     :default (let [{:keys [data pos]} @in
-                    out (.slice data pos (+ pos n))]
-                (when (< (.-length out) n)
-                  (throw (ex-info "cbor: unexpected end of input" {})))
-                (swap! in assoc :pos (+ pos n))
-                out)))
+(defn- utf8-width
+  "Bytes of the UTF-8 sequence that starts with a code point CP."
+  [cp]
+  (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+
+(defn- str->bytes
+  "The UTF-8 bytes of S as a vector of ints. On the hosts a lone surrogate
+  becomes U+FFFD (TextEncoder; the JDK's getBytes writes `?` instead -- the
+  one pre-existing host divergence, unchanged here). A Kotoba string is
+  UTF-8 already and cannot hold a lone surrogate."
+  [s]
+  #?(:clj (mapv #(bit-and % 0xff) (.getBytes ^String s "UTF-8"))
+     :cljs (let [a (.encode (js/TextEncoder.) s)
+                 n (.-length a)]
+             (loop [i 0 out (transient [])]
+               (if (< i n)
+                 (recur (inc i) (conj! out (aget a i)))
+                 (persistent! out))))
+     :default (let [n (string-byte-length s)]
+                (loop [i 0 out []]
+                  (if (< i n)
+                    (let [cp (string-code-point-at s i)]
+                      (recur (+ i (utf8-width cp)) (utf8-code-point out cp)))
+                    out)))))
 
 (defn- bytes->str [b]
   #?(:clj (String. ^bytes b "UTF-8")
-     :cljs (.decode (js/TextDecoder.) b)
-     :default (.decode (js/TextDecoder.) b)))
-
-(defn- str->bytes [s]
-  #?(:clj (.getBytes ^String s "UTF-8")
-     :cljs (.encode (js/TextEncoder.) s)
-     :default (.encode (js/TextEncoder.) s)))
+     :cljs (.decode (js/TextDecoder.) b)))
 
 (defn- finite-number? [x]
   #?(:clj (and (number? x) (Double/isFinite (double x)))
      :cljs (and (number? x) (js/Number.isFinite x))
-     :default (and (number? x) (js/Number.isFinite x))))
+     ;; IEEE-754: exponent field all ones is Inf or NaN.
+     :default (and (number? x)
+                   (not= 2047 (bit-and (u64-shift-right (f64-to-bits x) 52) 2047)))))
 
-(defn- float64-bytes [x]
-  #?(:clj (-> (ByteBuffer/allocate 8) (.putDouble (double x)) .array)
-     :cljs (let [buffer (js/ArrayBuffer. 8)]
-             (.setFloat64 (js/DataView. buffer) 0 x false)
-             (js/Uint8Array. buffer))
-     :default (let [buffer (js/ArrayBuffer. 8)]
-                (.setFloat64 (js/DataView. buffer) 0 x false)
-                (js/Uint8Array. buffer))))
+(defn- float64-bytes
+  "The 8 big-endian bytes of the binary64 X, as a vector of ints."
+  [x]
+  #?(:clj (let [b (-> (java.nio.ByteBuffer/allocate 8) (.putDouble (double x)) .array)]
+            (mapv #(bit-and % 0xff) b))
+     :cljs (let [buffer (js/ArrayBuffer. 8)
+                 view (js/DataView. buffer)]
+             (.setFloat64 view 0 x false)
+             (loop [i 0 out []]
+               (if (< i 8) (recur (inc i) (conj out (.getUint8 view i))) out)))
+     :default (let [bits (f64-to-bits x)]
+                (loop [s 56 out []]
+                  (if (< s 0)
+                    out
+                    (recur (- s 8) (conj out (bit-and (u64-shift-right bits s) 255))))))))
 
-(defn- bytes->float64 [bytes]
-  #?(:clj (.getDouble (ByteBuffer/wrap ^bytes bytes))
-     :cljs (.getFloat64 (js/DataView. (.-buffer bytes)
-                                     (.-byteOffset bytes)
-                                     (.-byteLength bytes))
+(defn- bytes->float64
+  "The binary64 whose big-endian bytes are the 8-byte container B."
+  [b]
+  #?(:clj (.getDouble (java.nio.ByteBuffer/wrap ^bytes b))
+     :cljs (.getFloat64 (js/DataView. (.-buffer b) (.-byteOffset b) (.-byteLength b))
                         0 false)
-     :default (.getFloat64 (js/DataView. (.-buffer bytes)
-                                        (.-byteOffset bytes)
-                                        (.-byteLength bytes))
-                           0 false)))
+     :default (f64-from-bits
+               (loop [i 0 acc 0]
+                 (if (< i 8)
+                   (recur (inc i) (bit-or (i64-shift-left acc 8) (in-byte b i)))
+                   acc)))))
 
-;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from `n`.
-;; :clj uses real 64-bit `long` bit ops. :cljs CANNOT use bit-and/bit-shift-*
-;; for this once `n` exceeds 2^32 -- JS's bitwise operators coerce their
-;; operand to Int32/Uint32 *first*, so e.g. `(unsigned-bit-shift-right
-;; 4294967296 24)` silently truncates 4294967296 to 0 before shifting at all.
-;; Division/mod are safe up to Number.MAX_SAFE_INTEGER (2^53), far more than
-;; this profile's practical range (timestamps, counters, seq numbers).
+(defn- bytes-like? [x]
+  #?(:clj (bytes? x)
+     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))))
+
+;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from a
+;; non-negative `n`. Division by a power of two, then the low 8 bits: exact
+;; on every host. JS bitwise operators coerce to Int32 first, so a shift of
+;; an n above 2^32 would truncate it before shifting; `quot` by 2^s does
+;; not (a double divides by a power of two exactly), and `bit-and 255`
+;; after it only needs the low bits, which ToInt32 keeps. On the JVM and in
+;; Kotoba n is an i64 and `quot` is the logical shift for n >= 0.
+(def ^:private byte-weights
+  {0 1 8 256 16 65536 24 16777216 32 4294967296 40 1099511627776
+   48 281474976710656 56 72057594037927936})
+
 (defn- byte-at [n s]
-  #?(:clj (bit-and (unsigned-bit-shift-right (long n) s) 0xff)
-     :cljs (mod (js/Math.floor (/ n (js/Math.pow 2 s))) 256)
-     ;; Kotoba integers are i64, so the :clj bit ops are exact here.
-     :default (bit-and (unsigned-bit-shift-right n s) 0xff)))
+  (bit-and (quot n (get byte-weights s)) 255))
 
 ;; ── encode ────────────────────────────────────────────────────────────────────
-(defn- write-head [o major n]
-  (let [mt (bit-shift-left major 5)]
+(defn- write-head [out major n]
+  (let [mt (* major 32)]
     (cond
-      (< n 24)        (write-byte! o (bit-or mt n))
-      (< n 0x100)     (do (write-byte! o (bit-or mt 24)) (write-byte! o n))
-      (< n 0x10000)   (do (write-byte! o (bit-or mt 25))
-                          (write-byte! o (bit-and (bit-shift-right n 8) 0xff))
-                          (write-byte! o (bit-and n 0xff)))
-      (< n 0x100000000) (do (write-byte! o (bit-or mt 26))
-                            (doseq [s [24 16 8 0]] (write-byte! o (byte-at n s))))
-      :else            (do (write-byte! o (bit-or mt 27))
-                           (doseq [s [56 48 40 32 24 16 8 0]]
-                             (write-byte! o (byte-at n s)))))))
+      ;; bit-or / bit-and 0xff, not +: a caller-supplied tag number that is
+      ;; negative or fractional lands here, and the pre-S1 byte sink masked
+      ;; every byte it was handed -- the bytes stay what they were.
+      (< n 24)          (conj out (bit-and (bit-or mt n) 0xff))
+      (< n 0x100)       (conj out (+ mt 24) (bit-and n 0xff))
+      (< n 0x10000)     (conj out (+ mt 25) (byte-at n 8) (byte-at n 0))
+      (< n 0x100000000) (conj out (+ mt 26) (byte-at n 24) (byte-at n 16)
+                              (byte-at n 8) (byte-at n 0))
+      :else             (conj out (+ mt 27) (byte-at n 56) (byte-at n 48)
+                              (byte-at n 40) (byte-at n 32) (byte-at n 24)
+                              (byte-at n 16) (byte-at n 8) (byte-at n 0)))))
+
+(defn- write-input-bytes
+  "OUT with every byte of the host byte container B appended. On :cljs the
+  container is appended as ONE element and copied by `out->bytes` (a 1 MiB
+  byte string was 10x slower on nbb one interpreted conj per byte); the JVM
+  appends by index; Kotoba appends each byte (no host container there)."
+  [out b]
+  #?(:clj (persistent! (areduce ^bytes b i acc (transient out) (conj! acc (bit-and (aget ^bytes b i) 0xff))))
+     :cljs (conj out b)
+     :default (let [n (in-count b)]
+                (loop [i 0 out out]
+                  (if (< i n) (recur (inc i) (conj out (in-byte b i))) out)))))
 
 (declare encode-into)
 
 (defn- key-bytes [k]
   (str->bytes (cond (string? k) k (keyword? k) (name k) :else (str k))))
 
-(defn- encoded-byte-count [b]
-  #?(:clj (count ^bytes b)
-     :cljs (.-length b)
-     :default (.-length b)))
-
-(defn- unsigned-key-byte [b i]
-  #?(:clj (bit-and (aget ^bytes b (int i)) 0xff)
-     :cljs (bit-and (aget b i) 0xff)
-     :default (bit-and (aget b i) 0xff)))
-
-(defn- dag-cbor-key< [a b]
-  (let [ka (key-bytes a) kb (key-bytes b)
-        la (encoded-byte-count ka) lb (encoded-byte-count kb)]
+(defn- key-bytes<
+  "dag-cbor key order over encoded keys: shorter first, then bytewise."
+  [ka kb]
+  (let [la (count ka) lb (count kb)]
     (if (not= la lb)
-      (< la lb)                                         ; shorter key first
-      (loop [i 0]                                        ; then bytewise unsigned
+      (< la lb)
+      (loop [i 0]
         (cond (= i la) false
-              (not= (unsigned-key-byte ka i) (unsigned-key-byte kb i))
-              (< (unsigned-key-byte ka i) (unsigned-key-byte kb i))
+              (not= (nth ka i) (nth kb i)) (< (nth ka i) (nth kb i))
               :else (recur (inc i)))))))
 
-(defn- encode-pairs [o pairs]
-  (write-head o 5 (count pairs))
-  (doseq [[k v] pairs]
-    (encode-into o (if (keyword? k) (name k) k))
-    (encode-into o v)))
+(defn- encode-pairs [out pairs]
+  (loop [ps (seq pairs) out (write-head out 5 (count pairs))]
+    (if ps
+      (let [[k v] (first ps)]
+        (recur (next ps) (encode-into (encode-into out (if (keyword? k) (name k) k)) v)))
+      out)))
 
-(defn- bytes-like? [x]
-  #?(:clj (bytes? x)
-     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))
-     :default (or (instance? js/Uint8Array x) (instance? js/Int8Array x))))
+(defn- sort-dag-cbor
+  "The [k v] entries of map M in dag-cbor key order. Each key is encoded
+  once, not once per comparison; ties keep `seq` order (a stable sort),
+  as the per-comparison form did."
+  [m]
+  (->> (seq m)
+       (map (fn [e] [(key-bytes (key e)) e]))
+       (sort-by first key-bytes<)
+       (map second)))
 
-(defn- encode-into [o x]
+(defn- write-text [out s]
+  #?(:cljs (let [u (.encode (js/TextEncoder.) s)]
+             (conj (write-head out 3 (.-length u)) u))
+     :default (let [b (str->bytes s)]
+                (into (write-head out 3 (count b)) b))))
+
+(defn- encode-into [out x]
   (cond
-    (nil? x)            (write-byte! o 0xf6)
-    (true? x)           (write-byte! o 0xf5)
-    (false? x)          (write-byte! o 0xf4)
-    (integer? x)        (if (neg? x) (write-head o 1 (- (- x) 1)) (write-head o 0 x))
+    (nil? x)            (conj out 0xf6)
+    (true? x)           (conj out 0xf5)
+    (false? x)          (conj out 0xf4)
+    (integer? x)        (if (neg? x) (write-head out 1 (- -1 x)) (write-head out 0 x))
     (number? x)         (if (finite-number? x)
-                          (do (write-byte! o 0xfb)
-                              (write-bytes! o (float64-bytes x)))
+                          (into (conj out 0xfb) (float64-bytes x))
                           (throw (ex-info "cbor: non-finite float unsupported"
                                           {:value x})))
-    (string? x)         (let [b (str->bytes x)] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
-    (keyword? x)        (let [b (str->bytes (name x))] (write-head o 3 (encoded-byte-count b)) (write-bytes! o b))
-    (bytes-like? x)     (do (write-head o 2 (encoded-byte-count x)) (write-bytes! o x))
-    (instance? Tagged x) (do (write-head o 6 (tag-number x))
-                             (encode-into o (tag-value x)))
-    (instance? OrderedMap x) (encode-pairs o (:pairs x))
-    (map? x)            (encode-pairs o (sort-by key dag-cbor-key< (seq x)))
-    (sequential? x)     (do (write-head o 4 (count x)) (doseq [e x] (encode-into o e)))
+    (string? x)         (write-text out x)
+    (keyword? x)        (write-text out (name x))
+    (bytes-like? x)     (write-input-bytes (write-head out 2 (in-count x)) x)
+    (instance? Tagged x) (encode-into (write-head out 6 (tag-number x)) (tag-value x))
+    (instance? OrderedMap x) (encode-pairs out (:pairs x))
+    (map? x)            (encode-pairs out (sort-dag-cbor x))
+    (sequential? x)     (reduce encode-into (write-head out 4 (count x)) x)
     :else (throw (ex-info "cbor: unsupported type" {:type (type x) :value x}))))
 
 (defn encode
   "Deterministic CBOR bytes for Clojure data. Map keys are sorted dag-cbor style."
   [x]
-  (let [o (new-out)] (encode-into o x) (out->bytes o)))
+  (out->bytes (encode-into [] x)))
 
 (defn encode-ordered
   "CBOR-encode a MAP given as an ordered seq of [k v] pairs — keys emitted in the
    given order (NOT sorted). For CAIP-122 CACAO and other order-sensitive formats."
   [pairs]
-  (let [o (new-out)] (encode-pairs o pairs) (out->bytes o)))
+  (out->bytes (encode-pairs [] pairs)))
 
 ;; ── decode ────────────────────────────────────────────────────────────────────
-;; Reconstructs a big-endian multi-byte integer via arithmetic (+ (* acc 256)
-;; byte), NOT bit-or/bit-shift-left -- the same 32-bit JS bitwise truncation
-;; `byte-at` above works around applies here too (an 8-byte read overflows
-;; 2^32 well before the loop finishes). Arithmetic is exact up to 2^53 on
-;; both platforms and identical to the bitwise version for non-negative
-;; accumulation.
-(defn- read-n [in cnt]
-  (loop [i 0 acc 0] (if (< i cnt) (recur (inc i) (+ (* acc 256) (read-byte! in))) acc)))
+;; Every reader takes the input and a position and answers [value next-pos].
+;; A big-endian multi-byte integer is rebuilt by arithmetic (+ (* acc 256)
+;; byte), NOT bit-or/bit-shift-left -- the JS 32-bit truncation `byte-at`
+;; avoids applies here too. Exact up to 2^53 on the hosts.
 
-(defn- read-arg [in info]
-  (cond (< info 24) info
-        (= info 24) (read-byte! in)
-        (= info 25) (read-n in 2)
-        (= info 26) (read-n in 4)
-        (= info 27) (read-n in 8)
+(defn- eof! []
+  (throw (ex-info "cbor: unexpected end of input" {})))
+
+(defn- read-byte [data pos]
+  (if (< pos (in-count data)) (in-byte data pos) (eof!)))
+
+(defn- read-n [data pos cnt]
+  (loop [i 0 acc 0]
+    (if (< i cnt) (recur (inc i) (+ (* acc 256) (read-byte data (+ pos i)))) [acc (+ pos cnt)])))
+
+(defn- read-arg [data pos info]
+  (cond (< info 24) [info pos]
+        (= info 24) [(read-byte data pos) (inc pos)]
+        (= info 25) (read-n data pos 2)
+        (= info 26) (read-n data pos 4)
+        (= info 27) (read-n data pos 8)
         :else (throw (ex-info "cbor: indefinite/reserved length unsupported" {:info info}))))
+
+(defn- read-bytes
+  "N bytes at POS. A short input throws rather than answering fewer bytes: a
+  truncated byte/text string must fail like every other truncated shape, not
+  decode into something wholly unlike the original."
+  [data pos n]
+  (when (> (+ pos n) (in-count data)) (eof!))
+  [(in-slice data pos (+ pos n)) (+ pos n)])
 
 (declare decode-from)
 
-(defn- decode-from [in]
-  (let [ib (read-byte! in)]
-    (when (neg? ib) (throw (ex-info "cbor: unexpected end of input" {})))
-    (let [major (bit-shift-right ib 5) info (bit-and ib 0x1f)]
-      (case (int major)
-        0 (read-arg in info)
-        1 (- (- (read-arg in info)) 1)
-        2 (read-bytes! in (read-arg in info))
-        3 (bytes->str (read-bytes! in (read-arg in info)))
-        4 (vec (repeatedly (read-arg in info) #(decode-from in)))
-        5 (into {} (repeatedly (read-arg in info) #(let [k (decode-from in)] [k (decode-from in)])))
-        6 (Tagged. (read-arg in info) (decode-from in))
-        7 (case (int info)
-            20 false
-            21 true
-            22 nil
-            27 (let [value (bytes->float64 (read-bytes! in 8))]
-                 (when-not (finite-number? value)
-                   (throw (ex-info "cbor: non-finite float unsupported"
-                                   {:value value})))
-                 value)
-            (throw (ex-info "cbor: unsupported simple/float" {:info info})))
-        (throw (ex-info "cbor: unsupported major type" {:major major}))))))
+(defn- decode-items [data pos n]
+  (loop [k 0 pos pos acc []]
+    (if (< k n)
+      (let [[v pos] (decode-from data pos)] (recur (inc k) pos (conj acc v)))
+      [acc pos])))
+
+(defn- decode-entries [data pos n]
+  (loop [k 0 pos pos acc {}]
+    (if (< k n)
+      (let [[key pos] (decode-from data pos)
+            [v pos] (decode-from data pos)]
+        (recur (inc k) pos (assoc acc key v)))
+      [acc pos])))
+
+(defn- decode-from [data pos]
+  (let [ib (read-byte data pos)
+        pos (inc pos)
+        major (quot ib 32)
+        info (bit-and ib 0x1f)]
+    (case major
+      0 (read-arg data pos info)
+      1 (let [[n pos] (read-arg data pos info)] [(- -1 n) pos])
+      2 (let [[n pos] (read-arg data pos info)] (read-bytes data pos n))
+      3 (let [[n pos] (read-arg data pos info)
+              [b pos] (read-bytes data pos n)]
+          [(bytes->str b) pos])
+      4 (let [[n pos] (read-arg data pos info)] (decode-items data pos n))
+      5 (let [[n pos] (read-arg data pos info)] (decode-entries data pos n))
+      6 (let [[n pos] (read-arg data pos info)
+              [v pos] (decode-from data pos)]
+          [(Tagged. n v) pos])
+      7 (case info
+          20 [false pos]
+          21 [true pos]
+          22 [nil pos]
+          27 (let [[b pos] (read-bytes data pos 8)
+                   value (bytes->float64 b)]
+               (when-not (finite-number? value)
+                 (throw (ex-info "cbor: non-finite float unsupported"
+                                 {:value value})))
+               [value pos])
+          (throw (ex-info "cbor: unsupported simple/float" {:info info})))
+      (throw (ex-info "cbor: unsupported major type" {:major major})))))
 
 (defn decode
   "Decode exactly one CBOR value. Maps → {}, arrays → [], text → String,
-   byte-strings → bytes (byte-array on :clj, Uint8Array on :cljs), ints and
-   finite float64 → numbers, true/false/null. Trailing bytes are rejected."
+   byte-strings → bytes (byte-array on :clj, a slice of the input's own kind
+   on :cljs, a vector of ints in Kotoba), ints and finite float64 → numbers,
+   true/false/null. Trailing bytes are rejected."
   [b]
-  (let [in (new-in b)
-        value (decode-from in)]
-    (when-not (neg? (read-byte! in))
+  (let [[value pos] (decode-from b 0)]
+    (when (< pos (in-count b))
       (throw (ex-info "cbor: trailing bytes after top-level value" {})))
     value))
