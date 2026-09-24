@@ -77,14 +77,29 @@
   (or (get (second (offsets s)) i)
       (throw (js/Error. "string-code-point-at: not a code-point boundary"))))
 
-(def leaf-names '#{utf8-code-point utf8-width str->bytes float64-bytes bytes->float64
+(defn k-bytes-from-vector-i64
+  "kotoba-lang's `bytes-from-vector-i64`: every item in [0,255] or it traps
+  (the trap name is the reference interpreter's)."
+  [v]
+  (when-not (every? #(<= 0 % 255) v) (throw (js/Error. "bytes/item-out-of-range")))
+  (js/Uint8Array.from (clj->js v)))
+(defn k-string-from-utf8
+  "kotoba-lang's `string-from-utf8`: canonical UTF-8 or a trap, never a
+  replacement. The trap's NAME is compared by the amu/osaho proofs; here only
+  refusal against acceptance, since the host branch answers one reason for all."
+  [b]
+  (try (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) b)
+       (catch :default _ (throw (js/Error. "utf8/invalid")))))
+
+(def leaf-names '#{utf8-code-point utf8-width str->bytes float64-bytes bytes->float64 bytes->str
                    finite-number? in-count in-byte in-slice out->bytes
                    write-input-bytes write-text
                    ;; shared (unconditional) helpers the leaves above call
                    write-head byte-at byte-weights})
 (def renames '{bit-and k-bit-and bit-or k-bit-or u64-shift-right k-u64-shift-right
                i64-shift-left k-i64-shift-left f64-to-bits k-f64-to-bits f64-from-bits k-f64-from-bits
-               string-byte-length k-string-byte-length string-code-point-at k-string-code-point-at})
+               string-byte-length k-string-byte-length string-code-point-at k-string-code-point-at
+               bytes-from-vector-i64 k-bytes-from-vector-i64 string-from-utf8 k-string-from-utf8})
 
 (defn- walk [f form]
   (let [form (f form)]
@@ -96,7 +111,13 @@
 (let [forms (kr/read-forms (str (fs/readFileSync (first *command-line-args*) "utf8")))
       leaves (->> forms
                   (filter #(and (seq? %) (#{'defn 'defn- 'def} (first %)) (leaf-names (second %))))
-                  (map (fn [form] (walk #(if (js-bigint? %) (literal %) (get renames % %)) form)))
+                  ;; Only a SYMBOL is looked up: with more than eight renames
+                  ;; the map hashes its key, and a form holding a BigInt
+                  ;; literal cannot be hashed on cljs.
+                  (map (fn [form] (walk #(cond (js-bigint? %) (literal %)
+                                               (symbol? %) (get renames % %)
+                                               :else %)
+                                        form)))
                   (map #(if (= 'def (first %)) % (cons 'defn (rest %)))))]
   (println "leaf :default bodies read:" (count leaves) "of" (count leaf-names))
   (when (< (count leaves) (count leaf-names))
@@ -168,6 +189,18 @@
           (remove #(= (host-bytes ((host "write-input-bytes") [7] (js/Uint8Array.from (clj->js %))))
                       ((pure "write-input-bytes") [7] %))
                   bstrs)))
+
+(let [valid (vec (concat [[] [0x41] [0xc2 0x80] [0xe3 0x81 0x82] [0xf0 0x9f 0x98 0x80] [0xf4 0x8f 0xbf 0xbf]]
+                          (repeatedly 5000 #(vec (array-seq (.encode (js/TextEncoder.)
+                                                                   (apply js/String.fromCodePoint
+                                                                          (repeatedly (rnd 20) (fn [] (let [c (rnd 0x10FFFF)] (if (<= 0xD800 c 0xDFFF) 0x41 c)))))))))))
+      invalid (vec (concat [[0xc0 0x80] [0xed 0xa0 0x80] [0xf4 0x90 0x80 0x80] [0xe3 0x81] [0x80] [0xff] [0xe0 0x80 0xaf]]
+                           (repeatedly 5000 #(vec (repeatedly (inc (rnd 12)) (fn [] (rnd 256)))))))
+      outcome (fn [f x] (try [:ok (f x)] (catch :default _ [:refused])))
+      compare (fn [v] (= (outcome (host "bytes->str") (js/Uint8Array.from (clj->js v)))
+                         (outcome (pure "bytes->str") v)))]
+  (report "bytes->str (canonical UTF-8: same string)" (count valid) (remove compare valid))
+  (report "bytes->str (random bytes: both refuse, or the same string)" (count invalid) (remove compare invalid)))
 
 (println "total differing:" @failures)
 (js/process.exit (if (zero? @failures) 0 1))

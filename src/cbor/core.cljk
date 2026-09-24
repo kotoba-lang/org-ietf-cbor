@@ -96,24 +96,33 @@
 ;;   write-input-bytes  by index / one chunk             conj loop
 ;;   write-text         (str->bytes) / one chunk        str->bytes + into
 ;;   out->bytes         byte-array / Uint8Array         the vector itself
-;;   bytes->str         String. / TextDecoder           (none: see below)
-;;   bytes-like?        bytes? / Uint8Array|Int8Array   (none: see below)
+;;   bytes->str         String. / TextDecoder (fatal)   string-from-utf8
+;;   bytes-like?        bytes? / Uint8Array|Int8Array   document-kind = :bytes
 ;;
 ;; The host branches must answer exactly what the `:default` answers: the
 ;; golden corpus (test/cbor/golden.edn, written by the pre-S1 host encoder)
 ;; pins the bytes, and scripts/verify-pure-leaves.cljk evaluates each
 ;; `:default` body on nbb against its host twin.
 ;;
-;; Two leaves have NO `:default`, on purpose, so the compiler reports them as
-;; `function body is empty` instead of a guessed body:
-;;   * bytes->str -- Kotoba text is UTF-8, but the language has no operation
-;;     that builds a string from bytes or code points (string-* heads read
-;;     strings; none constructs one from an i64). A language gap, not a
-;;     library one.
-;;   * bytes-like? -- a CBOR byte string must be told apart from an array of
-;;     small ints. adr-2609242330 makes bytes `vector<int 0..255>` for now,
-;;     which cannot be told apart from an array; that representation decision
-;;     is not this file's to make.
+;; The last two leaves had NO `:default` until 2026-09-25, on purpose, so the
+;; compiler reported them as `function body is empty` instead of a guessed
+;; body; each waited on a language decision, and both are now made (kotoba-lang
+;; lang/guest-grammar.edn `:bytes-value`, superproject adr-2609242330):
+;;   * bytes->str -- `(string-from-utf8 b)` is the language's string
+;;     constructor. It takes the language's byte string, `:bytes`, so the
+;;     vector of ints this file builds is converted with
+;;     `bytes-from-vector-i64` (which refuses an item outside [0,255] rather
+;;     than masking it). Canonical UTF-8 only: invalid text is REFUSED with a
+;;     named trap (utf8/overlong, utf8/surrogate, ...), never replaced with
+;;     U+FFFD -- so the host branches decode fatally too and throw
+;;     "cbor: invalid UTF-8 text" (they used to replace, the one place the
+;;     three hosts could decode one input to three different strings).
+;;   * bytes-like? -- a byte string is the `:bytes` TYPE, distinct from
+;;     `:vector-i64` in every checker; a value whose type is only known at run
+;;     time is a `:document`, and a document is a byte string when its kind is
+;;     `:bytes`. No document carries a bytes node yet (that is the next wall:
+;;     encode-into's dispatch over dynamic values), so today this answers false
+;;     for every document -- which is true: none of them is a byte string.
 
 (defn- out->bytes
   "The encoder's output as the host's byte container. On :cljs an element
@@ -193,8 +202,15 @@
                     out)))))
 
 (defn- bytes->str [b]
-  #?(:clj (String. ^bytes b "UTF-8")
-     :cljs (.decode (js/TextDecoder.) b)))
+  #?(:clj (try (str (.decode (doto (.newDecoder java.nio.charset.StandardCharsets/UTF_8)
+                                (.onMalformedInput java.nio.charset.CodingErrorAction/REPORT)
+                                (.onUnmappableCharacter java.nio.charset.CodingErrorAction/REPORT))
+                              (java.nio.ByteBuffer/wrap ^bytes b)))
+               (catch java.nio.charset.CharacterCodingException _
+                 (throw (ex-info "cbor: invalid UTF-8 text" {}))))
+     :cljs (try (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) b)
+                (catch :default _ (throw (ex-info "cbor: invalid UTF-8 text" {}))))
+     :default (string-from-utf8 (bytes-from-vector-i64 b))))
 
 (defn- finite-number? [x]
   #?(:clj (and (number? x) (Double/isFinite (double x)))
@@ -233,7 +249,8 @@
 
 (defn- bytes-like? [x]
   #?(:clj (bytes? x)
-     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))))
+     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))
+     :default (= (document-kind x) :bytes)))
 
 ;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from a
 ;; non-negative `n`. Division by a power of two, then the low 8 bits: exact
