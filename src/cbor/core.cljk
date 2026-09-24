@@ -83,32 +83,49 @@
 (defn tag-value [t] (:value t))
 
 ;; ── byte sink/source (the only platform-specific plumbing) ───────────────────
+;; Each body below also carries a `:default` clause. The Kotoba reader's only
+;; feature is :kotoba, so a `#?(:clj .. :cljs ..)`-only body read as NOTHING and
+;; the compiler refused the whole module as "function body is empty"
+;; (adr-2609111900). Clojure still picks :clj and ClojureScript/nbb :cljs (first
+;; match), so no existing host changes. Where the byte plumbing is host interop
+;; (JS arrays, TextEncoder, DataView) the :default clause is the :cljs form, which
+;; the Kotoba compiler then refuses BY NAME at that call -- the honest next wall,
+;; not a silent stub. `byte-at` has a real Kotoba body (i64 bit ops).
 (defn- new-out []
   #?(:clj (ByteArrayOutputStream.)
-     :cljs (array)))
+     :cljs (array)
+     :default (array)))
 
 (defn- write-byte! [o b]
   #?(:clj (.write ^ByteArrayOutputStream o (int b))
-     :cljs (.push o (bit-and b 0xff))))
+     :cljs (.push o (bit-and b 0xff))
+     :default (.push o (bit-and b 0xff))))
 
 (defn- write-bytes! [o bs]
   #?(:clj (.write ^ByteArrayOutputStream o ^bytes bs)
-     :cljs (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))))
+     :cljs (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))
+     :default (dotimes [i (alength bs)] (.push o (bit-and (aget bs i) 0xff)))))
 
 (defn- out->bytes [o]
   #?(:clj (.toByteArray ^ByteArrayOutputStream o)
-     :cljs (js/Uint8Array. o)))
+     :cljs (js/Uint8Array. o)
+     :default (js/Uint8Array. o)))
 
 (defn- new-in [b]
   #?(:clj (ByteArrayInputStream. b)
-     :cljs (atom {:data b :pos 0})))
+     :cljs (atom {:data b :pos 0})
+     :default (atom {:data b :pos 0})))
 
 (defn- read-byte! [in]
   #?(:clj (.read ^ByteArrayInputStream in)
      :cljs (let [{:keys [data pos]} @in]
              (if (< pos (alength data))
                (do (swap! in assoc :pos (inc pos)) (bit-and (aget data pos) 0xff))
-               -1))))
+               -1))
+     :default (let [{:keys [data pos]} @in]
+                (if (< pos (alength data))
+                  (do (swap! in assoc :pos (inc pos)) (bit-and (aget data pos) 0xff))
+                  -1))))
 
 (defn- read-bytes! [in n]
   ;; InputStream.read(byte[],off,len) (:clj) and .slice (:cljs) both silently
@@ -128,32 +145,48 @@
              (when (< (.-length out) n)
                (throw (ex-info "cbor: unexpected end of input" {})))
              (swap! in assoc :pos (+ pos n))
-             out)))
+             out)
+     :default (let [{:keys [data pos]} @in
+                    out (.slice data pos (+ pos n))]
+                (when (< (.-length out) n)
+                  (throw (ex-info "cbor: unexpected end of input" {})))
+                (swap! in assoc :pos (+ pos n))
+                out)))
 
 (defn- bytes->str [b]
   #?(:clj (String. ^bytes b "UTF-8")
-     :cljs (.decode (js/TextDecoder.) b)))
+     :cljs (.decode (js/TextDecoder.) b)
+     :default (.decode (js/TextDecoder.) b)))
 
 (defn- str->bytes [s]
   #?(:clj (.getBytes ^String s "UTF-8")
-     :cljs (.encode (js/TextEncoder.) s)))
+     :cljs (.encode (js/TextEncoder.) s)
+     :default (.encode (js/TextEncoder.) s)))
 
 (defn- finite-number? [x]
   #?(:clj (and (number? x) (Double/isFinite (double x)))
-     :cljs (and (number? x) (js/Number.isFinite x))))
+     :cljs (and (number? x) (js/Number.isFinite x))
+     :default (and (number? x) (js/Number.isFinite x))))
 
 (defn- float64-bytes [x]
   #?(:clj (-> (ByteBuffer/allocate 8) (.putDouble (double x)) .array)
      :cljs (let [buffer (js/ArrayBuffer. 8)]
              (.setFloat64 (js/DataView. buffer) 0 x false)
-             (js/Uint8Array. buffer))))
+             (js/Uint8Array. buffer))
+     :default (let [buffer (js/ArrayBuffer. 8)]
+                (.setFloat64 (js/DataView. buffer) 0 x false)
+                (js/Uint8Array. buffer))))
 
 (defn- bytes->float64 [bytes]
   #?(:clj (.getDouble (ByteBuffer/wrap ^bytes bytes))
      :cljs (.getFloat64 (js/DataView. (.-buffer bytes)
                                      (.-byteOffset bytes)
                                      (.-byteLength bytes))
-                        0 false)))
+                        0 false)
+     :default (.getFloat64 (js/DataView. (.-buffer bytes)
+                                        (.-byteOffset bytes)
+                                        (.-byteLength bytes))
+                           0 false)))
 
 ;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from `n`.
 ;; :clj uses real 64-bit `long` bit ops. :cljs CANNOT use bit-and/bit-shift-*
@@ -164,7 +197,9 @@
 ;; this profile's practical range (timestamps, counters, seq numbers).
 (defn- byte-at [n s]
   #?(:clj (bit-and (unsigned-bit-shift-right (long n) s) 0xff)
-     :cljs (mod (js/Math.floor (/ n (js/Math.pow 2 s))) 256)))
+     :cljs (mod (js/Math.floor (/ n (js/Math.pow 2 s))) 256)
+     ;; Kotoba integers are i64, so the :clj bit ops are exact here.
+     :default (bit-and (unsigned-bit-shift-right n s) 0xff)))
 
 ;; ── encode ────────────────────────────────────────────────────────────────────
 (defn- write-head [o major n]
@@ -188,11 +223,13 @@
 
 (defn- encoded-byte-count [b]
   #?(:clj (count ^bytes b)
-     :cljs (.-length b)))
+     :cljs (.-length b)
+     :default (.-length b)))
 
 (defn- unsigned-key-byte [b i]
   #?(:clj (bit-and (aget ^bytes b (int i)) 0xff)
-     :cljs (bit-and (aget b i) 0xff)))
+     :cljs (bit-and (aget b i) 0xff)
+     :default (bit-and (aget b i) 0xff)))
 
 (defn- dag-cbor-key< [a b]
   (let [ka (key-bytes a) kb (key-bytes b)
@@ -213,7 +250,8 @@
 
 (defn- bytes-like? [x]
   #?(:clj (bytes? x)
-     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))))
+     :cljs (or (instance? js/Uint8Array x) (instance? js/Int8Array x))
+     :default (or (instance? js/Uint8Array x) (instance? js/Int8Array x))))
 
 (defn- encode-into [o x]
   (cond
