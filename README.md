@@ -27,6 +27,37 @@ coordinators each open-code the major-type headers). This is that once.
   text → `String`, byte-strings → bytes (byte-array on JVM, `Uint8Array` on
   cljs), ints/finite float64 → numbers, true/false/null. Trailing bytes fail.
 
+### The typed encoder (Kotoba)
+
+`encode` works out each value's type at run time. Kotoba has no value whose
+type is only known at run time, so the Kotoba module is a typed encoder
+instead (adr-2609242330 S1c): one function per CBOR type, with types resolved
+statically. Each function returns a *fragment*, which is a vector of ints
+holding one encoded item. The same functions exist on the hosts and give the
+same bytes as `encode` (`test/cbor/core_typed_test.cljk`,
+`scripts/verify-pure-leaves.cljk`, `scripts/verify-kotoba-golden.cljk`).
+
+```clojure
+(cbor/fragment-bytes
+ (cbor/encode-map
+  (-> (cbor/map-entries)
+      (cbor/map-entry "a" (cbor/encode-uint 1))
+      (cbor/map-entry "b" (cbor/encode-array
+                           (-> (cbor/array-items)
+                               (cbor/array-item (cbor/encode-uint 2))
+                               (cbor/array-item (cbor/encode-text "x"))))))))
+;=> the bytes of (cbor/encode {"a" 1 "b" [2 "x"]})
+```
+
+The scalar encoders are `encode-null`, `encode-bool`, `encode-uint`,
+`encode-nint`, `encode-int`, `encode-f64` (always 8 bytes), `encode-text`,
+`encode-bytes` and `encode-tag n fragment`. Arrays are built with
+`array-items`, `array-item` and `encode-array`. Maps are built with
+`map-entries` and `map-entry` (string keys), then closed with `encode-map`
+(canonical DAG-CBOR key order) or `encode-map-ordered` (insertion order).
+On the hosts only, you also get `encode`, `encode-ordered`, `decode`,
+`tagged` and `ordered`.
+
 Supported major types: 0 uint · 1 negint · 2 byte-string · 3 text · 4 array ·
 5 map · 6 explicit tags · 7 (false/true/null/finite float64). No indefinite
 lengths. Floats always encode as IEEE-754 binary64; NaN and infinities are

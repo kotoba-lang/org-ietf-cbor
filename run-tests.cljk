@@ -20,10 +20,11 @@
       kbb --backend sci --classpath src:test run-tests.cljk"
   (:require [cljs.test :as t]
             [cbor.core-test]
-            [cbor.core-golden-test]))
+            [cbor.core-golden-test]
+            [cbor.core-typed-test]))
 
 (defmethod t/report [::t/default :end-run-tests] [m]
   (when-not (t/successful? m)
     (js/process.exit 1)))
 
-(t/run-tests 'cbor.core-test 'cbor.core-golden-test)
+(t/run-tests 'cbor.core-test 'cbor.core-golden-test 'cbor.core-typed-test)

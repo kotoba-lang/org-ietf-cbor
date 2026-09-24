@@ -57,6 +57,10 @@
 (defn k-bit-and [a b] (norm (js-and (i64 a) (i64 b))))
 (defn k-bit-or [a b] (norm (js-or (i64 a) (i64 b))))
 (defn k-u64-shift-right [x s] (norm (js-shr (js/BigInt.asUintN 64 (big x)) (js/BigInt s))))
+(defn k-vector-conj [v x] (conj v x))
+(defn k-vector-take [v n] (subvec v 0 n))
+(defn k-vector-drop [v n] (subvec v n))
+(defn k-vector-assoc [v i x] (assoc v i x))
 (defn k-i64-shift-left [x s] (norm (js-shl (big x) (js/BigInt s))))
 (defn k-f64-to-bits [x]
   (let [v (js/DataView. (js/ArrayBuffer. 8))] (.setFloat64 v 0 x) (norm (.getBigInt64 v 0))))
@@ -91,15 +95,45 @@
   (try (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) b)
        (catch :default _ (throw (js/Error. "utf8/invalid")))))
 
-(def leaf-names '#{utf8-code-point utf8-width str->bytes float64-bytes bytes->float64 bytes->str
+(def leaf-names '#{push append-all utf8-code-point utf8-width str->bytes float64-bytes bytes->float64 bytes->str
                    finite-number? in-count in-byte in-slice out->bytes
-                   write-input-bytes write-text
+                   write-text
                    ;; shared (unconditional) helpers the leaves above call
                    write-head byte-at byte-weights})
+;; The typed encoder (S1c): every other Kotoba-read definition. They are
+;; evaluated with the leaves, so the whole Kotoba reading of the typed API
+;; runs here and is compared with the host functions of the same name.
+(def typed-names '#{write-null write-bool write-int write-f64 byte-items write-byte-string
+                    vec-slice vec-set add-entry entry-fragment-start entry-end entry-offsets
+                    key-less? merge-runs merge-pass sorted-offsets write-entries
+                    encode-null encode-bool encode-uint encode-nint encode-int encode-f64
+                    encode-text encode-bytes encode-tag array-items array-item encode-array
+                    map-entries map-entry encode-map encode-map-ordered fragment-bytes})
 (def renames '{bit-and k-bit-and bit-or k-bit-or u64-shift-right k-u64-shift-right
                i64-shift-left k-i64-shift-left f64-to-bits k-f64-to-bits f64-from-bits k-f64-from-bits
                string-byte-length k-string-byte-length string-code-point-at k-string-code-point-at
-               bytes-from-vector-i64 k-bytes-from-vector-i64 string-from-utf8 k-string-from-utf8})
+               bytes-from-vector-i64 k-bytes-from-vector-i64 string-from-utf8 k-string-from-utf8
+               vector-conj k-vector-conj vector-take k-vector-take vector-drop k-vector-drop
+               vector-assoc k-vector-assoc})
+
+(defn- type-item?
+  "A Kotoba type in a parameter vector or result position: a keyword, or a
+  vector headed by one (`[:fn ...]`, `[:vector ...]`)."
+  [x] (or (keyword? x) (and (vector? x) (keyword? (first x)))))
+
+(defn- strip-types
+  "The defn FORM without its Kotoba types: parameter vector items that are
+  types, and the result type right after the parameter vector. An
+  unannotated parameter stays as it is."
+  [form]
+  (if (and (seq? form) (#{'defn 'defn-} (first form)))
+    (let [[head nm & more] form
+          [doc more] (if (string? (first more)) [[(first more)] (rest more)] [[] more])
+          params (vec (remove type-item? (first more)))
+          body (rest more)
+          body (if (and (next body) (type-item? (first body))) (rest body) body)]
+      (apply list head nm (concat doc [params] body)))
+    form))
 
 (defn- walk [f form]
   (let [form (f form)]
@@ -110,7 +144,8 @@
 
 (let [forms (kr/read-forms (str (fs/readFileSync (first *command-line-args*) "utf8")))
       leaves (->> forms
-                  (filter #(and (seq? %) (#{'defn 'defn- 'def} (first %)) (leaf-names (second %))))
+                  (filter #(and (seq? %) (#{'defn 'defn- 'def} (first %)) (or (leaf-names (second %)) (typed-names (second %)))))
+                  (map strip-types)
                   ;; Only a SYMBOL is looked up: with more than eight renames
                   ;; the map hashes its key, and a form holding a BigInt
                   ;; literal cannot be hashed on cljs.
@@ -119,8 +154,8 @@
                                                :else %)
                                         form)))
                   (map #(if (= 'def (first %)) % (cons 'defn (rest %)))))]
-  (println "leaf :default bodies read:" (count leaves) "of" (count leaf-names))
-  (when (< (count leaves) (count leaf-names))
+  (println "Kotoba bodies read:" (count leaves) "of" (+ (count leaf-names) (count typed-names)))
+  (when (< (count leaves) (+ (count leaf-names) (count typed-names)))
     (js/process.exit 2))
   (load-string (str "(ns verify-pure-leaves.pure (:require [verify-pure-leaves :refer ["
                     (apply str (interpose " " (map name (vals renames)))) "]]))\n"
@@ -185,9 +220,10 @@
       host-bytes (fn [f] (vec (array-seq ((host "out->bytes") f))))]
   (report "write-text (head + UTF-8, host chunk vs pure bytes)" (count strs)
           (remove #(= (host-bytes ((host "write-text") [7] %)) ((pure "write-text") [7] %)) strs))
-  (report "write-input-bytes (host chunk vs pure bytes)" (count bstrs)
-          (remove #(= (host-bytes ((host "write-input-bytes") [7] (js/Uint8Array.from (clj->js %))))
-                      ((pure "write-input-bytes") [7] %))
+  (report "write-byte-string (pure) vs host write-input-bytes (chunk)" (count bstrs)
+          (remove #(= (host-bytes ((host "write-input-bytes") ((host "write-head") [7] 2 (count %))
+                                                             (js/Uint8Array.from (clj->js %))))
+                      ((pure "write-byte-string") [7] %))
                   bstrs)))
 
 (let [valid (vec (concat [[] [0x41] [0xc2 0x80] [0xe3 0x81 0x82] [0xf0 0x9f 0x98 0x80] [0xf4 0x8f 0xbf 0xbf]]
@@ -201,6 +237,65 @@
                          (outcome (pure "bytes->str") v)))]
   (report "bytes->str (canonical UTF-8: same string)" (count valid) (remove compare valid))
   (report "bytes->str (random bytes: both refuse, or the same string)" (count invalid) (remove compare invalid)))
+
+
+;; ── the typed encoder: Kotoba reading vs host, and vs the host `encode` ──
+;; Each shape is generated, encoded by the Kotoba reading of the typed
+;; function (pure), by the same function on the host, and by the dynamic
+;; host `encode` of the equivalent Clojure value; all three must agree.
+(let [enc (fn [x] (vec (array-seq ((host "encode") x))))
+      rand-str (fn [] (apply js/String.fromCodePoint
+                             (repeatedly (rnd 12) #(let [c (case (rnd 3) 0 (rnd 0x80) 1 (+ 0x80 (rnd 0xF780)) 2 (+ 0x10000 (rnd 0x100000)))]
+                                                     (if (<= 0xD800 c 0xDFFF) 0x41 c)))))
+      rand-uint (fn [] (case (rnd 5) 0 (rnd 24) 1 (rnd 256) 2 (rnd 65536) 3 (* (rnd 65536) (rnd 65536))
+                         4 (+ (* (rnd 2097152) 4294967296) (rnd 2147483647))))
+      three (fn [label xs pure-f host-f dyn-f]
+              (report (str label " (pure = host typed = host encode)") (count xs)
+                      (remove #(let [p (pure-f %) h (host-f %) d (dyn-f %)] (and (= p h) (= h d))) xs)))
+      uints (vec (concat [0 23 24 255 256 65535 65536 4294967295 4294967296 js/Number.MAX_SAFE_INTEGER]
+                         (repeatedly 3000 rand-uint)))
+      strs (vec (concat ["" "a" (apply str (repeat 24 "b")) (apply str (repeat 300 "日"))] (repeatedly 3000 rand-str)))
+      floats (vec (remove #(or (not (js/Number.isFinite %)) (js/Number.isInteger %)) (repeatedly 3000 rand-double)))
+      bstrs (vec (repeatedly 1000 #(vec (repeatedly (rnd 300) (fn [] (rnd 256))))))]
+  (three "encode-uint" uints (pure "encode-uint") (host "encode-uint") enc)
+  (three "encode-nint" (mapv #(- -1 %) uints) (pure "encode-nint") (host "encode-nint") enc)
+  (three "encode-int" (vec (mapcat (fn [n] [n (- -1 n)]) uints)) (pure "encode-int") (host "encode-int") enc)
+  (three "encode-text" strs (pure "encode-text") (host "encode-text") enc)
+  (three "encode-f64 (non-integral finite)" floats (pure "encode-f64") (host "encode-f64") enc)
+  (three "encode-bytes" bstrs (pure "encode-bytes") (host "encode-bytes")
+         #(enc (js/Uint8Array.from (clj->js %))))
+  (three "encode-bool / encode-null" [true false nil]
+         #(if (nil? %) ((pure "encode-null")) ((pure "encode-bool") %))
+         #(if (nil? %) ((host "encode-null")) ((host "encode-bool") %)) enc)
+  ;; records: a map of random string keys to ints and strings, encoded
+  ;; field by field through map-entry and canonically sorted by encode-map
+  (let [records (vec (repeatedly 2000 (fn [] (into {} (repeatedly (rnd 12) (fn [] [(rand-str) (if (zero? (rnd 2)) (rand-uint) (rand-str))]))))))
+        typed (fn [ns-f]
+                (fn [m] ((ns-f "encode-map")
+                         (reduce (fn [es [k v]] ((ns-f "map-entry") es k (if (string? v) ((ns-f "encode-text") v) ((ns-f "encode-uint") v))))
+                                 ((ns-f "map-entries")) (seq m)))))]
+    (three "encode-map of map-entry (random records)" records (typed pure) (typed host) enc))
+  ;; heterogeneous arrays with a tag: [uint text bytes tag42(bytes) nested-array]
+  (let [rows (vec (repeatedly 2000 (fn [] [(rand-uint) (rand-str) (vec (repeatedly (rnd 40) #(rnd 256)))])))
+        typed (fn [ns-f]
+                (fn [[u s b]]
+                  ((ns-f "encode-array")
+                   (-> ((ns-f "array-items"))
+                       ((ns-f "array-item") ((ns-f "encode-uint") u))
+                       ((ns-f "array-item") ((ns-f "encode-text") s))
+                       ((ns-f "array-item") ((ns-f "encode-bytes") b))
+                       ((ns-f "array-item") ((ns-f "encode-tag") 42 ((ns-f "encode-bytes") b)))
+                       ((ns-f "array-item") ((ns-f "encode-array") ((ns-f "array-item") ((ns-f "array-items")) ((ns-f "encode-null")))))))))
+        dyn (fn [[u s b]] (let [hb #(js/Uint8Array.from (clj->js b))]
+                            (enc [u s (hb) ((host "tagged") 42 (hb)) [nil]])))]
+    (three "encode-array / encode-tag (heterogeneous rows)" rows (typed pure) (typed host) dyn))
+  ;; ordered maps keep insertion order
+  (let [rows (vec (repeatedly 1000 (fn [] (vec (repeatedly (rnd 8) (fn [] [(rand-str) (rand-uint)]))))))
+        typed (fn [ns-f]
+                (fn [ps] ((ns-f "encode-map-ordered")
+                          (reduce (fn [es [k v]] ((ns-f "map-entry") es k ((ns-f "encode-uint") v))) ((ns-f "map-entries")) ps))))]
+    (three "encode-map-ordered (insertion order)" rows (typed pure) (typed host)
+           #(vec (array-seq ((host "encode-ordered") %))))))
 
 (println "total differing:" @failures)
 (js/process.exit (if (zero? @failures) 0 1))
