@@ -1,0 +1,173 @@
+;; verify-pure-leaves.cljk -- the `:default` (Kotoba) bodies of cbor.core's
+;; byte-plumbing leaves, evaluated on nbb and compared with the host (:cljs)
+;; bodies on the same inputs (adr-2609242330 S1).
+;;
+;; nbb reads `:cljs`, so the `:default` bodies never run in this repository's
+;; suite. This script reads src/cbor/core.cljk with the Kotoba reader
+;; (`kotoba.compiler.kotoba-reader`, feature :kotoba else :default -- the
+;; branch the compiler sees), takes the leaf defns, renames the Kotoba
+;; builtins they call to the emulations below, and evaluates them into a
+;; scratch namespace. Integer literals come back from that reader as BigInt
+;; (i64); they are narrowed to Number when exact.
+;;
+;;   kbb --backend sci \
+;;     --classpath "src:<kotoba-sema>/src:<text>/src:scripts" \
+;;     scripts/verify-pure-leaves.cljk src/cbor/core.cljk
+;;
+;; Exit 0 = every compared input agreed; 1 = at least one differed; 2 = a
+;; leaf could not be read (fewer bodies than named: nothing was compared for
+;; it, which is not agreement).
+;;
+;; The emulations are the part this trusts: i64 is a BigInt wrapped to 64
+;; bits (asIntN) and every bitwise op goes through BigInt, so a Number above
+;; 2^31 is never truncated by JS's Int32 operators. `string-code-point-at`
+;; takes a UTF-8 BYTE offset, as the builtin does; the emulation builds the
+;; offset table from `codePointAt`, so it is only defined for well-formed
+;; strings -- which is all a Kotoba string can be.
+;;
+;; NaN payloads are not compared by `float64-bytes`: passing a signalling NaN
+;; through this emulation's BigInt path quiets it (measured: host 7ff1...,
+;; emulated 7ff9...), and `encode` refuses every non-finite float before
+;; `float64-bytes` is reached, so no encoded byte depends on it.
+
+(ns verify-pure-leaves
+  (:require ["node:fs" :as fs]
+            [kotoba.compiler.kotoba-reader :as kr]
+            [cbor.core]))
+
+(def ^:private js-and (js/Function. "a" "b" "return a & b"))
+(def ^:private js-or (js/Function. "a" "b" "return a | b"))
+(def ^:private js-shr (js/Function. "a" "b" "return a >> b"))
+(def ^:private js-shl (js/Function. "a" "b" "return a << b"))
+(def js-bigint? (js/Function. "a" "return typeof a === 'bigint'"))
+(defn big [x] (if (js-bigint? x) x (js/BigInt x)))
+(defn norm [b]
+  (let [b (js/BigInt.asIntN 64 b)]
+    (if (and (<= b (js/BigInt js/Number.MAX_SAFE_INTEGER))
+             (>= b (js/BigInt (- js/Number.MAX_SAFE_INTEGER))))
+      (js/Number b)
+      b)))
+(defn- literal
+  "A reader integer literal (BigInt) as a value `load-string` can print and
+  read back: a Number when the double holds it exactly (2^56 does), else it
+  stays a BigInt and the print fails loudly rather than rounding."
+  [b]
+  (let [n (js/Number b)] (if (= b (js/BigInt n)) n b)))
+(defn- i64 [x] (js/BigInt.asIntN 64 (big x)))
+(defn k-bit-and [a b] (norm (js-and (i64 a) (i64 b))))
+(defn k-bit-or [a b] (norm (js-or (i64 a) (i64 b))))
+(defn k-u64-shift-right [x s] (norm (js-shr (js/BigInt.asUintN 64 (big x)) (js/BigInt s))))
+(defn k-i64-shift-left [x s] (norm (js-shl (big x) (js/BigInt s))))
+(defn k-f64-to-bits [x]
+  (let [v (js/DataView. (js/ArrayBuffer. 8))] (.setFloat64 v 0 x) (norm (.getBigInt64 v 0))))
+(defn k-f64-from-bits [b]
+  (let [v (js/DataView. (js/ArrayBuffer. 8))] (.setBigInt64 v 0 (i64 b)) (.getFloat64 v 0)))
+(def ^:private offsets
+  (memoize
+   (fn [s]
+     (loop [i 0 off 0 out {}]
+       (if (< i (.-length s))
+         (let [cp (.codePointAt s i)]
+           (recur (+ i (if (> cp 0xFFFF) 2 1))
+                  (+ off (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+                  (assoc out off cp)))
+         [off out])))))
+(defn k-string-byte-length [s] (first (offsets s)))
+(defn k-string-code-point-at [s i]
+  (or (get (second (offsets s)) i)
+      (throw (js/Error. "string-code-point-at: not a code-point boundary"))))
+
+(def leaf-names '#{utf8-code-point utf8-width str->bytes float64-bytes bytes->float64
+                   finite-number? in-count in-byte in-slice out->bytes
+                   write-input-bytes write-text
+                   ;; shared (unconditional) helpers the leaves above call
+                   write-head byte-at byte-weights})
+(def renames '{bit-and k-bit-and bit-or k-bit-or u64-shift-right k-u64-shift-right
+               i64-shift-left k-i64-shift-left f64-to-bits k-f64-to-bits f64-from-bits k-f64-from-bits
+               string-byte-length k-string-byte-length string-code-point-at k-string-code-point-at})
+
+(defn- walk [f form]
+  (let [form (f form)]
+    (cond (seq? form) (apply list (map #(walk f %) form))
+          (vector? form) (mapv #(walk f %) form)
+          (map? form) (into {} (map (fn [[k v]] [(walk f k) (walk f v)]) form))
+          :else form)))
+
+(let [forms (kr/read-forms (str (fs/readFileSync (first *command-line-args*) "utf8")))
+      leaves (->> forms
+                  (filter #(and (seq? %) (#{'defn 'defn- 'def} (first %)) (leaf-names (second %))))
+                  (map (fn [form] (walk #(if (js-bigint? %) (literal %) (get renames % %)) form)))
+                  (map #(if (= 'def (first %)) % (cons 'defn (rest %)))))]
+  (println "leaf :default bodies read:" (count leaves) "of" (count leaf-names))
+  (when (< (count leaves) (count leaf-names))
+    (js/process.exit 2))
+  (load-string (str "(ns verify-pure-leaves.pure (:require [verify-pure-leaves :refer ["
+                    (apply str (interpose " " (map name (vals renames)))) "]]))\n"
+                    (apply str (map pr-str leaves)))))
+
+(def ^:private seed (atom 99))
+(defn- rnd [n] (swap! seed #(mod (* % 48271) 2147483647)) (mod @seed n))
+(defn- rand-double []
+  (let [v (js/DataView. (js/ArrayBuffer. 8))]
+    (dotimes [i 8] (.setUint8 v i (rnd 256)))
+    (.getFloat64 v 0)))
+(defn- same-float? [a b] (or (and (js/Number.isNaN a) (js/Number.isNaN b)) (js/Object.is a b)))
+(defn- pure [s] @(resolve (symbol "verify-pure-leaves.pure" s)))
+(defn- host [s] @(resolve (symbol "cbor.core" s)))
+
+(def ^:private failures (atom 0))
+(defn- report [label n bad]
+  (swap! failures + (count bad))
+  (println (str label ": inputs " n ", differ " (count bad)) (vec (take 3 bad))))
+
+(let [edge [0.0 -0.0 1.0 -1.0 0.5 1.5 -2.5 5e-324 -5e-324 2.2250738585072014E-308
+            1.7976931348623157E308 js/Number.MAX_SAFE_INTEGER (inc js/Number.MAX_SAFE_INTEGER)
+            (- js/Number.MAX_SAFE_INTEGER) 9223372036854775807 -9223372036854775808
+            js/NaN js/Infinity (- js/Infinity) 0.1 1e300 1e-300]
+      floats (vec (concat edge (repeatedly 100000 rand-double)))
+      numbers (remove js/Number.isNaN floats)]
+  (report "float64-bytes (non-NaN)" (count numbers)
+          (remove #(= ((host "float64-bytes") %) ((pure "float64-bytes") %)) numbers))
+  (report "bytes->float64 (host bytes in, NaN = NaN)" (count floats)
+          (remove #(let [b ((host "float64-bytes") %)]
+                     (and (same-float? ((host "bytes->float64") (js/Uint8Array.from (clj->js b)))
+                                       ((pure "bytes->float64") b))
+                          (same-float? % ((pure "bytes->float64") b))))
+                  floats))
+  (report "finite-number?" (count floats)
+          (remove #(= ((host "finite-number?") %) ((pure "finite-number?") %)) floats)))
+
+(let [rand-cp (fn [] (let [c (case (rnd 4) 0 (rnd 0x80) 1 (+ 0x80 (rnd 0x780))
+                                  2 (+ 0x800 (rnd 0xF800)) 3 (+ 0x10000 (rnd 0x100000)))]
+                       (if (<= 0xD800 c 0xDFFF) 0x41 c)))
+      strs (vec (concat ["" "a" "été" "日本語" "😀" "\u0000"
+                         "\u007f\u0080߿ࠀ￿𐀀􏿿"
+                         (apply str (repeat 70000 "e"))]
+                        (repeatedly 20000 #(apply js/String.fromCodePoint (repeatedly (rnd 30) rand-cp)))))]
+  (report "str->bytes (well-formed strings)" (count strs)
+          (remove #(= ((host "str->bytes") %) ((pure "str->bytes") %)) strs)))
+
+(let [vs (vec (repeatedly 2000 #(vec (repeatedly (rnd 40) (fn [] (rnd 256))))))
+      as (map #(js/Uint8Array.from (clj->js %)) vs)]
+  (report "in-count / in-byte / in-slice / out->bytes" (count vs)
+          (remove (fn [[v a]]
+                    (let [n (count v) from (if (pos? n) (rnd n) 0) to (+ from (rnd (inc (- n from))))]
+                      (and (= ((host "in-count") a) ((pure "in-count") v))
+                           (every? #(= ((host "in-byte") a %) ((pure "in-byte") v %)) (range n))
+                           (= (vec (array-seq ((host "in-slice") a from to))) ((pure "in-slice") v from to))
+                           (= (vec (array-seq ((host "out->bytes") v))) ((pure "out->bytes") v)))))
+                  (map vector vs as))))
+
+(let [strs ["" "a" "\u00e9t\u00e9" (apply str (repeat 24 "b")) (apply str (repeat 300 "\u65e5")) (apply str (repeat 70000 "e"))]
+      bstrs (concat [[] [0] (vec (range 24)) (vec (map #(mod % 256) (range 300)))]
+                    (repeatedly 500 #(vec (repeatedly (rnd 400) (fn [] (rnd 256))))))
+      host-bytes (fn [f] (vec (array-seq ((host "out->bytes") f))))]
+  (report "write-text (head + UTF-8, host chunk vs pure bytes)" (count strs)
+          (remove #(= (host-bytes ((host "write-text") [7] %)) ((pure "write-text") [7] %)) strs))
+  (report "write-input-bytes (host chunk vs pure bytes)" (count bstrs)
+          (remove #(= (host-bytes ((host "write-input-bytes") [7] (js/Uint8Array.from (clj->js %))))
+                      ((pure "write-input-bytes") [7] %))
+                  bstrs)))
+
+(println "total differing:" @failures)
+(js/process.exit (if (zero? @failures) 0 1))

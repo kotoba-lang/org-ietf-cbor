@@ -35,9 +35,18 @@ rejected. `io-ipld` layers DAG-CBOR's tag-42-only and string-key rules on top.
 ## Portability
 
 `cbor.core` used to be `cbor.core.clj` — JVM-only despite living in a
-`.cljc`-named ecosystem. It is now genuinely portable: byte buffers are
-`java.io.ByteArrayOutputStream`/`ByteArrayInputStream` on `:clj` and a plain
-growable JS array / an atom-backed cursor over a `Uint8Array` on `:cljs`.
+`.cljc`-named ecosystem. It is now portable and its byte plumbing is pure
+(adr-2609242330 S1, 2026-09-24): the encoder builds a vector of ints 0..255
+and the decoder threads a position through the reads. What differs per host
+is a small set of leaves (UTF-8, float64 bits, the byte container), each
+with a `:default` clause that is a Kotoba body (`f64-to-bits`,
+`string-code-point-at`, ...). `test/cbor/golden.edn` pins the encoded bytes
+of a 2,367-value corpus to the pre-rewrite encoder, and
+`scripts/verify-pure-leaves.cljk` runs every `:default` body on nbb against
+its host twin. Two leaves have no `:default` on purpose -- UTF-8 bytes to a
+string (Kotoba has no string constructor from bytes) and "is this a byte
+string" (the Kotoba bytes representation is not decided) -- so the compiler
+names them as `function body is empty`.
 
 One correctness pitfall worth calling out because it's easy to reintroduce:
 **big-endian multi-byte integers (the `uint32`/`uint64` header forms) must be
