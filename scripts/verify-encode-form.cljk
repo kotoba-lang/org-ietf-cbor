@@ -1,0 +1,50 @@
+(ns verify-encode-form
+  "`encode-form` (the Kotoba Form-tree encoder of cbor.core) against the host
+  `encode`, on the KIR interpreter. nbb reads `:cljs`, so the Kotoba bodies never
+  run in this repository's suite; this reads src/cbor/core.cljk with the Kotoba
+  reader through `sema/analyze`, appends a probe that encodes a Form built from
+  each case, executes it, and compares its bytes with `cbor/encode` of the same
+  Clojure value. Exit code is not set; a FAIL line is a difference.
+
+      kbb --backend sci \\
+        --classpath \"src:<kotoba-sema>/src:<osaho>/src:<hir>/src:...\" \\
+        scripts/verify-encode-form.cljk"
+  (:require ["node:fs" :as fs]
+            [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]
+            [cbor.core :as cbor]))
+
+(def src (.readFileSync fs "src/cbor/core.cljk" "utf8"))
+;; node constructors
+(defn nilf [] "(record-new [:ref :form/r] 0 \"\" 0 :none (typed-list-new [:list [:ref :form/r]]) 0 (bytes-empty))")
+(defn form-src [x]
+  (let [mk (fn [t s n k kids] (str "(record-new [:ref :form/r] " t " " (pr-str s) " " n " " k " " kids " 0 (bytes-empty))"))
+        lst (fn [xs] (str "(typed-list-new [:list [:ref :form/r]] " (str/join " " (map form-src xs)) ")"))]
+    (cond
+      (nil? x) (mk 0 "" 0 ":none" (lst []))
+      (boolean? x) (mk 1 "" (if x 1 0) ":none" (lst []))
+      (integer? x) (mk 2 "" x ":none" (lst []))
+      (string? x) (mk 3 x 0 ":none" (lst []))
+      (keyword? x) (mk 4 "" 0 (str x) (lst []))
+      (vector? x) (mk 7 "" 0 ":none" (lst x))
+      (map? x) (mk 9 "" 0 ":none" (lst (mapcat identity x)))
+      :else (throw (ex-info "no" {:x x})))))
+
+(defn run-case [x]
+  (let [prog (-> src
+                 (str/replace "fragment-bytes encode-form encode-form-bytes]" "fragment-bytes encode-form encode-form-bytes probe]")
+                 (str "\n(defn probe [] :vector-i64 (encode-form " (form-src x) "))\n"))
+        r (kir/execute (kir/lower (sema/analyze prog)) 'probe [] {})
+        got (mapv #(js/Number %) r)
+        want (mapv #(bit-and % 0xff) (array-seq (cbor/encode x)))]
+    {:x x :ok (= got want) :got got :want want}))
+
+(def cases
+  [nil true false 0 23 24 255 256 65536 4294967296 -1 -25 -1000 "" "abc" "été"
+   [] [1 2 3] ["a" [true nil] "b"]
+   {"b" 1 "a" 2} {"aa" 1 "b" [1] "a" {"z" nil}} {:x 1 :yy "s"}
+   ["map" [["str" "k"] ["int" "1"]]] ["nil"] ["bool" true]])
+(doseq [c cases]
+  (let [r (run-case c)]
+    (println (if (:ok r) "ok  " "FAIL") (pr-str c) (when-not (:ok r) (pr-str r)))))

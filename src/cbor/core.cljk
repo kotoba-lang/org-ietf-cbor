@@ -70,7 +70,7 @@
                                 encode-f64 encode-text encode-bytes encode-tag
                                 array-items array-item encode-array
                                 map-entries map-entry encode-map encode-map-ordered
-                                fragment-bytes]
+                                fragment-bytes encode-form encode-form-bytes]
                        :default [OrderedMap Tagged decode encode encode-ordered ordered tag-number
                                  tag-value tagged tagged?
                                  encode-null encode-bool encode-uint encode-nint encode-int
@@ -78,7 +78,10 @@
                                  array-items array-item encode-array
                                  map-entries map-entry encode-map encode-map-ordered
                                  fragment-bytes])]}
-  )
+  ;; Kotoba: the dynamic value of the compiler's own data is the recursive
+  ;; `:form/r` record of kotoba.form (the same schema, so the same type).
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]})))
 
 ;; ── host-only: the two records ───────────────────────────────────────────────
 ;; (Kotoba reads the `:kotoba` clause: a placeholder `def`, since only
@@ -584,6 +587,68 @@
   :cljs); in Kotoba the vector of ints itself."
   [#?@(:kotoba [fragment :vector-i64] :default [fragment])] #?@(:kotoba [:vector-i64])
   (out->bytes fragment))
+
+;; ── Kotoba: the Form-tree encoder ────────────────────────────────────────────
+;; The host `encode` below dispatches on the run-time type of a Clojure value.
+;; Kotoba has no such value except the recursive `:form/r` record (kotoba.form:
+;; tags 0 nil, 1 bool, 2 int, 3 string, 4 keyword, 5 symbol, 6 list, 7 vector,
+;; 8 set, 9 map with kids k v k v ..., 10 f64 bits, 11 bytes), so `encode-form`
+;; is `encode` over it, branch for branch: nil -> null, bool, int -> major 0/1,
+;; string and keyword (its name) -> text, list and vector -> array, map ->
+;; canonical DAG-CBOR key order (a key is a string or a keyword), f64 -> binary64
+;; (finite only), bytes -> byte string. What the host `encode` refuses (a
+;; symbol, a set, a map key of another type, a non-finite float) is a trap here:
+;; the encoder is exported, and an exported function cannot abort. The bytes of
+;; every accepted value equal `encode`'s (test/cbor/form_test.cljk).
+#?(:kotoba
+   (defn- form-map-entries [kids [:list [:ref :form/r]] i entries :vector-i64] :vector-i64
+     (if (>= i (vector-count kids))
+       entries
+       (let [k (typed-list-nth [:list [:ref :form/r]] kids i)
+             v (typed-list-nth [:list [:ref :form/r]] kids (+ i 1))
+             tag (record-get [:ref :form/r] k :tag)
+             key (if (= tag 3)
+                   (record-get [:ref :form/r] k :s)
+                   (if (= tag 4)
+                     (keyword-name (record-get [:ref :form/r] k :k))
+                     (let [refused (assert (= tag 3))] "")))]
+         (form-map-entries kids (+ i 2)
+                           (map-entry entries key (encode-form-into [] v)))))))
+
+#?(:kotoba
+   (defn- form-array-items [out :vector-i64 kids [:list [:ref :form/r]] i] :vector-i64
+     (if (>= i (vector-count kids))
+       out
+       (form-array-items (encode-form-into out (typed-list-nth [:list [:ref :form/r]] kids i))
+                         kids (+ i 1)))))
+
+#?(:kotoba
+   (defn- encode-form-into [out :vector-i64 f [:ref :form/r]] :vector-i64
+     (let [tag (record-get [:ref :form/r] f :tag)
+           kids (record-get [:ref :form/r] f :kids)]
+       (cond
+         (= tag 0) (write-null out)
+         (= tag 1) (write-bool out (= 1 (record-get [:ref :form/r] f :n)))
+         (= tag 2) (write-int out (record-get [:ref :form/r] f :n))
+         (= tag 3) (write-text out (record-get [:ref :form/r] f :s))
+         (= tag 4) (write-text out (keyword-name (record-get [:ref :form/r] f :k)))
+         (or (= tag 6) (= tag 7)) (form-array-items (write-head out 4 (vector-count kids)) kids 0)
+         (= tag 9) (append-all out (encode-map (form-map-entries kids 0 [])))
+         (= tag 10) (write-f64 out (f64-from-bits (record-get [:ref :form/r] f :n)))
+         (= tag 11) (write-byte-string out (vector-i64-from-bytes (record-get [:ref :form/r] f :data)))
+         :else (let [refused (assert (= tag 0))] out)))))
+
+#?(:kotoba
+   (defn encode-form
+     "Deterministic CBOR for the Form F, as a fragment (a vector of ints 0..255)."
+     [f [:ref :form/r]] :vector-i64
+     (encode-form-into [] f)))
+
+#?(:kotoba
+   (defn encode-form-bytes
+     "`encode-form` as `:bytes`."
+     [f [:ref :form/r]] :bytes
+     (bytes-from-vector-i64 (encode-form-into [] f))))
 
 ;; ── host-only: the dynamic encoder and the decoder ───────────────────────────
 ;; `encode` dispatches on the run-time type of its argument and `decode`
